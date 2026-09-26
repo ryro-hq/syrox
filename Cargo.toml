@@ -1,0 +1,44 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/syrox",
+    "crates/syrox-engine",
+    "crates/syrox-lang",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "Apache-2.0"
+repository = "https://github.com/ryro-hq/syrox"
+
+[workspace.dependencies]
+syrox-lang = { version = "0.1.0", path = "crates/syrox-lang" }
+syrox-engine = { version = "0.1.0", path = "crates/syrox-engine" }
+ariadne = "0.6.0"
+clap = { version = "4.6.6", default-features = false, features = [
+    "derive",
+    "error-context",
+    "help",
+    "std",
+    "suggestions",
+    "usage",
+] }
+thiserror = "2.0.20"
+sha2 = { version = "=0.10.9", default-features = false }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_lifetimes = "deny"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

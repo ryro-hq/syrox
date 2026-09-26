@@ -1,0 +1,19 @@
+mod recipe {
+    value Name(str);
+
+    struct Request {
+        name: Name;
+    }
+
+    fn make(name: Name) -> Request {
+        Request { name = name; }
+    }
+}
+
+inputs {
+    channel = "pinned";
+}
+
+outputs {
+    app: recipe::Request = recipe::make("app");
+}

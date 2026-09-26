@@ -1,0 +1,15 @@
+outputs {
+    library: std::Package = std::Package {
+        id = "library";
+        dependencies = [];
+    };
+
+    application: std::Package = std::Package {
+        id = "application";
+        dependencies = [
+            std::Dependency {
+                package = "library";
+            },
+        ];
+    };
+}

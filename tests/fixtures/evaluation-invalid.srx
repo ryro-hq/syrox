@@ -1,0 +1,5 @@
+resource Port(int);
+
+outputs {
+    duplicate: [Port] = [Port(80), Port(80)];
+}

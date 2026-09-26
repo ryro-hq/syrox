@@ -1,0 +1,33 @@
+[package]
+name = "syrox"
+description = "The Syrox package manager command-line interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+clap.workspace = true
+syrox-engine.workspace = true
+signal-hook = { version = "=0.4.4", default-features = false }
+sha2.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "=1.0.0-alpha.4"
+
+[dev-dependencies]
+flate2 = "=1.1.9"
+tempfile = "=3.23.0"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "srx"
+path = "src/main.rs"
+
+[[bin]]
+name = "syrox-worker"
+path = "src/worker.rs"

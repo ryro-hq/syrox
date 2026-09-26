@@ -1,0 +1,3 @@
+inputs {
+    package = "git:https://example.invalid/package";
+}
