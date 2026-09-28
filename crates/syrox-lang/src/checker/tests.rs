@@ -254,6 +254,73 @@ fn comparisons_join_affine_moves_and_require_ordered_matching_operands() {
 }
 
 #[test]
+fn module_exports_require_concrete_public_function_signatures_and_reusable_mappers() {
+    for (declarations, mapper, expected) in [
+        (
+            "value Key(str); value I(int); mod collection { pub fn make() -> I { I(1) } }",
+            "once fn(key: Key, make: fn() -> I) -> Key { key }",
+            "module mapper must be a reusable function",
+        ),
+        (
+            "resource Key(str); value I(int); mod collection { pub fn make() -> I { I(1) } }",
+            "fn(key: Key, make: fn() -> I) -> Key { key }",
+            "module key must be a reusable value(str)",
+        ),
+        (
+            "value Key(str); value I(int); mod collection { pub fn make<T>(item: T) -> T { item } }",
+            "fn(key: Key, make: fn() -> I) -> Key { key }",
+            "requires explicit generic specialization",
+        ),
+        (
+            "value Key(str); value I(int); mod collection { pub fn make(item: I) -> I { item } }",
+            "fn(key: Key, make: fn() -> I) -> Key { key }",
+            "module export `` type mismatch",
+        ),
+    ] {
+        let source = format!(
+            "{declarations} outputs {{ keys: [Key] = module_exports(collection, make, {mapper}); }}"
+        );
+        let errors = messages(&source);
+        assert!(
+            errors.iter().any(|message| message.contains(expected)),
+            "{errors:?}"
+        );
+    }
+}
+
+#[test]
+fn module_export_entries_count_toward_the_metadata_budget() {
+    use std::fmt::Write as _;
+    let mut modules = String::new();
+    for index in 0..40 {
+        write!(modules, "mod m{index} {{ pub use implementation::make; }}").unwrap();
+    }
+    let source = format!(
+        r"
+        value Key(str); value I(int);
+        mod implementation {{ pub fn make() -> I {{ I(1) }} }}
+        mod collection {{ {modules} }}
+        outputs {{ keys: [Key] = module_exports(collection, make, fn(key: Key, make: fn() -> I) -> Key {{ key }}); }}
+    "
+    );
+    let errors = check_with_limits(
+        resolved(&source),
+        &CheckPolicy::default(),
+        CheckLimits {
+            max_metadata_units: 20,
+            ..CheckLimits::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.message.contains("checked metadata limit")),
+        "{errors:?}"
+    );
+}
+
+#[test]
 fn inferred_function_and_enum_instances_use_the_shared_budget() {
     for source in [
         "value I(int); value S(str); fn id<T>(x: T) -> T { x } outputs { a: I = id(I(1)); b: S = id(S(\"x\")); }",

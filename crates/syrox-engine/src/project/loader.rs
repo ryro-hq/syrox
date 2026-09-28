@@ -781,26 +781,18 @@ fn open_child_root(
     display: &Path,
     budget: &mut LoadBudget,
 ) -> Result<OpenedPath, CheckFailure> {
-    // Resolve the parent through the top-level no-symlink traversal, then
-    // reopen the project beneath it to confirm the pinned directory identity.
-    let parent = open_top(&path.join(".."), budget)?;
-    let pinned = open_beneath(
-        parent.fd(),
-        Path::new(
-            path.file_name()
-                .ok_or_else(|| CheckFailure::InputNotDirectory {
-                    path: path.to_path_buf(),
-                })?,
-        ),
-        path,
-        true,
-        budget,
-    )?;
+    // Revalidate the visible root without symlinks, then resolve its parent
+    // through the pinned descriptor. A root spelled `.` has no basename.
+    let pinned = open_top(path, budget)?;
     if identity(&pinned) != identity(project) {
         return Err(CheckFailure::ChildProjectCycle {
             path: path.to_path_buf(),
         });
     }
+    budget.charge_work()?;
+    let parent = linux_fd::open_project_parent(project.fd())
+        .map_err(|source| open_error(&path.join(".."), source))?;
+    budget.charge_work()?;
     let child = open_beneath(parent.fd(), relative, display, true, budget)?;
     if file_type(&child) != FileType::Directory {
         return Err(CheckFailure::InputNotDirectory {

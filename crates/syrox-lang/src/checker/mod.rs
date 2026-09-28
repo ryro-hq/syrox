@@ -1,5 +1,6 @@
 //! Type, policy and affine ownership checking for resolved Syrox programs.
 
+mod collections;
 mod enums;
 mod expressions;
 mod functions;
@@ -86,6 +87,7 @@ struct Checker<'a> {
     diagnostics: Vec<Diagnostic>,
     expressions: Vec<CheckedExpression>,
     patterns: Vec<CheckedPattern>,
+    collection_metadata_units: usize,
     references: BTreeMap<(u32, u32, u32), ResolvedTarget>,
     local_at: BTreeMap<(u32, u32, u32), LocalId>,
     item_at: BTreeMap<(u32, u32, u32), ItemId>,
@@ -120,6 +122,7 @@ impl<'a> Checker<'a> {
             diagnostics: Vec::new(),
             expressions: Vec::new(),
             patterns: Vec::new(),
+            collection_metadata_units: 0,
             references: BTreeMap::new(),
             local_at: BTreeMap::new(),
             item_at: BTreeMap::new(),

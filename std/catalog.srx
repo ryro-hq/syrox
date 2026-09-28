@@ -1,0 +1,30 @@
+mod std::catalog {
+    // A reusable set of typed factories. Looking up names never runs recipes.
+    opaque struct PackageSet<R> {
+        factories: OrderedMap<fn() -> R>;
+    }
+
+    pub fn package_set<R>(
+        entries: [MapEntry<fn() -> R>],
+    ) -> Result<PackageSet<R>, MapKey> {
+        match map_from_entries(entries) {
+            Ok(factories) => Result::Ok(PackageSet<R> { factories = factories; }),
+            Err(key) => Result::Err(key),
+        }
+    }
+
+    pub fn package_names<R>(packages: PackageSet<R>) -> [MapKey] {
+        map_keys(packages.factories)
+    }
+
+    pub fn package_factory<R>(packages: PackageSet<R>, key: MapKey) -> Option<fn() -> R> {
+        map_get(packages.factories, key)
+    }
+
+    pub fn package_get<R>(packages: PackageSet<R>, key: MapKey) -> Option<R> {
+        match package_factory(packages, key) {
+            Some(factory) => Option::Some(factory()),
+            None => Option::None(),
+        }
+    }
+}

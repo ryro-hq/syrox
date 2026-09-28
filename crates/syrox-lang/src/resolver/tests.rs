@@ -70,6 +70,62 @@ fn duplicate_declarations_and_import_conflicts_are_diagnosed() {
 }
 
 #[test]
+fn module_export_selection_rejects_non_namespaces_and_non_function_exports() {
+    for (declaration, namespace, expected) in [
+        (
+            "value NotModule(str);",
+            "NotModule",
+            "requires a module namespace",
+        ),
+        (
+            "mod collection { pub struct make {} }",
+            "collection",
+            "must be a function",
+        ),
+        ("mod collection {}", "absent", "requires a module namespace"),
+    ] {
+        let source = format!(
+            "value Key(str); value I(int); {declaration} outputs {{ keys: [Key] = module_exports({namespace}, make, fn(key: Key, f: fn() -> I) -> Key {{ key }}); }}"
+        );
+        let diagnostics = errors(&[("main.srx", &source)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|error| error.message.contains(expected)),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn repeated_module_projections_charge_key_bytes_and_sorting_work() {
+    use std::fmt::Write as _;
+    let mut source = String::from(
+        "value Key(str); value I(int); mod implementation { pub fn make() -> I { I(1) } } mod collection {",
+    );
+    for index in 0..400 {
+        write!(
+            source,
+            "mod m{index}{} {{ pub use implementation::make; }}",
+            "x".repeat(250)
+        )
+        .unwrap();
+    }
+    source.push_str("} outputs {");
+    for index in 0..3 {
+        write!(source, "keys{index}: [Key] = module_exports(collection, make, fn(key: Key, f: fn() -> I) -> Key {{ key }});").unwrap();
+    }
+    source.push('}');
+    let diagnostics = errors(&[("main.srx", &source)]);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|error| error.message.contains("name resolution work limit")),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
 fn unknown_types_and_closed_interface_private_access_are_diagnosed() {
     let unknown = errors(&[("main.srx", "fn bad(item: Missing) {}")]);
     assert!(

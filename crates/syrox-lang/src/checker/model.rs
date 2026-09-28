@@ -57,6 +57,10 @@ impl Ty {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Elaboration {
+    ModuleExports {
+        key: ItemId,
+        function: Ty,
+    },
     VariantConstructor {
         index: u32,
     },

@@ -2,6 +2,8 @@ mod std {
     pub use option::Option;
     pub use result::Result;
 
+    pub use catalog::{PackageSet, package_set, package_names, package_factory, package_get};
+
     pub use list::{map, flatten, filter_map, filter};
     pub use maps::{
         OrderedMap, MapKey, MapEntry,

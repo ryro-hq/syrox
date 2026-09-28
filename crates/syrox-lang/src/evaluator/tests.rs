@@ -319,6 +319,105 @@ fn comparison_charges_string_bytes_to_the_work_budget() {
 }
 
 #[test]
+fn module_exports_are_typed_byte_sorted_and_do_not_call_factories() {
+    let program = run(
+        r"
+        value Key(str);
+        value I(int);
+        mod library {
+            pub fn factory() -> I { I(1) }
+            mod a { mod child { pub use library::factory; } }
+            mod a0 { pub use library::factory; }
+            mod hidden { fn factory() -> I { I(2) } }
+            mod z { pub fn factory() -> I { factory() } }
+        }
+        outputs {
+            keys: [Key] = module_exports(library, factory, fn(key: Key, make: fn() -> I) -> Key { key });
+        }
+    ",
+        &CheckPolicy::default(),
+    );
+    assert!(program.is_success(), "{program:?}");
+    let Some(Value::List { items, .. }) = program.roots().next().unwrap().value() else {
+        panic!("expected module keys");
+    };
+    let names: Vec<_> = items
+        .iter()
+        .map(|item| match item {
+            Value::Nominal {
+                value: PrimitiveValue::Str(key),
+                ..
+            } => key.as_str(),
+            _ => panic!("expected key value"),
+        })
+        .collect();
+    assert_eq!(names, ["", "a0", "a::child", "z"]);
+}
+
+#[test]
+fn module_exports_apply_key_refinements_and_runtime_budgets() {
+    use std::fmt::Write as _;
+    let policy = CheckPolicy::default();
+    let invalid = run(
+        r#"
+        value Key(str) where in ["allowed"];
+        value I(int);
+        mod collection { mod denied { pub fn make() -> I { I(1) } } }
+        outputs { keys: [Key] = module_exports(collection, make, fn(key: Key, make: fn() -> I) -> Key { key }); }
+    "#,
+        &policy,
+    );
+    assert!(!invalid.is_success());
+    let mut modules = String::new();
+    for index in 0..40 {
+        write!(modules, "mod m{index} {{ pub use implementation::make; }}").unwrap();
+    }
+    let source = format!(
+        r"
+        value Key(str); value I(int);
+        mod implementation {{ pub fn make() -> I {{ I(1) }} }}
+        mod collection {{ {modules} }}
+        outputs {{ keys: [Key] = module_exports(collection, make, fn(key: Key, make: fn() -> I) -> Key {{ key }}); }}
+    "
+    );
+    let program = checked(&source, &policy);
+    for (limits, expected) in [
+        (
+            EvaluationLimits {
+                max_steps_per_root: 20,
+                ..EvaluationLimits::default()
+            },
+            "step limit",
+        ),
+        (
+            EvaluationLimits {
+                max_expansion_bytes: 2048,
+                ..EvaluationLimits::default()
+            },
+            "expansion byte limit",
+        ),
+    ] {
+        let result = evaluate_with_limits(
+            &program,
+            &policy,
+            &EvaluationEnvironment::new(&policy),
+            limits,
+        )
+        .unwrap();
+        assert!(
+            result
+                .roots()
+                .next()
+                .unwrap()
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(expected)),
+            "{result:?}"
+        );
+    }
+}
+
+#[test]
 fn consumable_closures_capture_and_return_affine_values() {
     let program = run(
         r"

@@ -74,7 +74,11 @@ impl<'a> Checker<'a> {
     }
 
     pub(super) fn reserve_metadata(&mut self, span: Span) -> bool {
-        if self.expressions.len().saturating_add(self.patterns.len())
+        if self
+            .expressions
+            .len()
+            .saturating_add(self.patterns.len())
+            .saturating_add(self.collection_metadata_units)
             >= self.limits.max_metadata_units
         {
             if !self.exhausted {

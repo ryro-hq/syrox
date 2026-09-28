@@ -267,6 +267,71 @@ fn compact_cli_selects_project_file_searches_pinned_catalog_and_checks_dry_run()
 }
 
 #[test]
+fn explicit_recipe_export_selected_from_imported_package_set_works_in_cli() {
+    let fixture = Fixture::new();
+    let catalog = fixture.directory.path().join("catalog");
+    fs::create_dir_all(catalog.join("recipes")).unwrap();
+    fs::write(
+        catalog.join("main.srx"),
+        r#"
+        inputs { recipes = "modules:recipes"; }
+        pub type Entry = std::Recipe<std::AutotoolsBuild>;
+        outputs {
+            packages: std::Result<std::PackageSet<Entry>, std::MapKey> = std::package_set(
+                module_exports(recipes, recipe, std::MapEntry::Entry<fn() -> Entry>)
+            );
+        }
+    "#,
+    )
+    .unwrap();
+    fs::write(catalog.join("recipes/hello.srx"), r#"
+        pub fn recipe() -> std::Recipe<std::AutotoolsBuild> {
+            std::Recipe<std::AutotoolsBuild> {
+                package = std::Package { id = "internal-hello"; dependencies = []; };
+                acquisition = std::Acquisition { package = "internal-hello"; sources = [std::source_request(
+                    "https://nonexistent.invalid/source", "0000000000000000000000000000000000000000000000000000000000000000", 100
+                )]; };
+                build = std::AutotoolsBuild { package = "internal-hello"; source_directory = "hello-1";
+                    entry = "usr/bin/hello"; timeout_seconds = 30; };
+            }
+        }
+    "#).unwrap();
+    fs::write(
+        catalog.join("recipes/unused.srx"),
+        "pub fn recipe() -> std::Recipe<std::AutotoolsBuild> { recipe() }",
+    )
+    .unwrap();
+    success(fixture.run(&["project", "lock", catalog.to_str().unwrap()]));
+    fs::write(
+        fixture.project.join("main.srx"),
+        r#"
+        inputs { pkgs = "path:../catalog"; }
+        fn select() -> pkgs::Entry {
+            match pkgs::packages {
+                Ok(packages) => match std::package_get(packages, "hello") {
+                    Some(recipe) => recipe, None => select(),
+                },
+                Err(_) => select(),
+            }
+        }
+        outputs { friendly: pkgs::Entry = select(); }
+    "#,
+    )
+    .unwrap();
+    success(fixture.run(&["project", "lock", "."]));
+    let info = success(fixture.run(&["info", ".#friendly"]));
+    assert!(info.contains("internal-hello"));
+    assert!(
+        success(fixture.run(&["build", "-n", ".#friendly"])).contains("would build internal-hello")
+    );
+    let all = success(fixture.run(&["build", "-n", "-A"]));
+    assert!(all.contains("friendly"));
+    assert!(!all.contains("unused"));
+    failure(fixture.run(&["info", "."]), "DefaultBuild");
+    assert!(!fixture.store.exists());
+}
+
+#[test]
 fn store_gc_previews_and_collects_only_unretained_objects() {
     let fixture = Fixture::new();
     let store = Store::initialize(&fixture.store).unwrap();

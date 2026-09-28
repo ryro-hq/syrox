@@ -100,6 +100,7 @@ impl Parser<'_> {
             TokenKind::Keyword(Keyword::Fn | Keyword::Once) => self.parse_closure(),
             TokenKind::Keyword(Keyword::Fold) => self.parse_fold(),
             TokenKind::Keyword(Keyword::Compare) => self.parse_compare(),
+            TokenKind::Keyword(Keyword::ModuleExports) => self.parse_module_exports(),
             _ => {
                 self.error(Diagnostic::error("expected expression", token.span));
                 None
@@ -146,6 +147,30 @@ impl Parser<'_> {
                 parameters,
                 result,
                 body,
+            },
+        })
+    }
+
+    fn parse_module_exports(&mut self) -> Option<Expression> {
+        let start = self.advance()?.span;
+        let open = self.expect(TokenKind::LeftParen, "expected `(` after `module_exports`")?;
+        if !self.enter(open.span) {
+            return None;
+        }
+        let namespace = self.parse_path("expected module namespace")?;
+        self.expect(TokenKind::Comma, "expected `,` after module namespace")?;
+        let export = self.ident("expected public export name")?;
+        self.expect(TokenKind::Comma, "expected `,` after export name")?;
+        let mapper = self.parse_expression()?;
+        self.consume(TokenKind::Comma);
+        let close = self.expect(TokenKind::RightParen, "expected `)` after module mapper");
+        self.leave();
+        Some(Expression {
+            span: start.join(close?.span),
+            kind: ExpressionKind::ModuleExports {
+                namespace,
+                export,
+                mapper: Box::new(mapper),
             },
         })
     }

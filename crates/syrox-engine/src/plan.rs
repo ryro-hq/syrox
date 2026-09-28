@@ -12,6 +12,7 @@ use crate::AuthenticatedStandardLibrary;
 use crate::store::{ContentDigest, MAX_STORE_BLOB_BYTES};
 
 mod builds;
+mod recipes;
 pub use builds::PlanBuild;
 mod apps;
 pub use apps::PlanApplication;
@@ -117,6 +118,8 @@ impl PlanAcquisition {
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PlanError {
+    #[error("invalid recipe root `{root}`: {reason}")]
+    InvalidRecipe { root: String, reason: &'static str },
     #[error("function values cannot be serialized into a plan")]
     FunctionValue,
     #[error("build root `{root}` is invalid: {reason}")]
@@ -421,18 +424,25 @@ impl Plan {
             });
         }
         roots.sort_by(|left, right| (&left.domain, &left.path).cmp(&(&right.domain, &right.path)));
-        let (packages, package_edges) = extract_packages(realized, standard_library, &mut budget)?;
+        let components = recipes::components(realized, standard_library, &mut budget)?;
+        let (packages, package_edges) =
+            extract_packages(&components, standard_library, &mut budget)?;
         let acquisitions =
-            extract_acquisitions(realized, &packages, standard_library, &mut budget)?;
+            extract_acquisitions(&components, &packages, standard_library, &mut budget)?;
         let (builds, default_build) = builds::extract(
-            realized,
+            &components,
             &packages,
             &acquisitions,
             standard_library,
             &mut budget,
         )?;
-        let (applications, default_application) =
-            apps::extract(realized, &packages, &builds, standard_library, &mut budget)?;
+        let (applications, default_application) = apps::extract(
+            &components,
+            &packages,
+            &builds,
+            standard_library,
+            &mut budget,
+        )?;
         for build in &builds {
             if let Some(development) = build.development()
                 && !applications.iter().any(|app| {
@@ -559,7 +569,7 @@ impl ProjectionBudget {
 
 #[allow(clippy::too_many_lines)]
 fn extract_packages(
-    realized: &RealizedProgram,
+    components: &[recipes::Component<'_>],
     standard_library: Option<&AuthenticatedStandardLibrary>,
     budget: &mut ProjectionBudget,
 ) -> Result<(Vec<PlanPackage>, usize), PlanError> {
@@ -567,11 +577,11 @@ fn extract_packages(
         return Ok((Vec::new(), 0));
     }
 
-    let mut exact_roots: Vec<_> = realized
-        .roots()
+    let mut exact_roots: Vec<_> = components
+        .iter()
         .filter(|root| {
             root.identity().domain() == syrox_lang::SourceDomainId::project()
-                && root.ty().is_some_and(|ty| exact_nominal(ty, PACKAGE_PATH))
+                && exact_nominal(root.ty(), PACKAGE_PATH)
         })
         .collect();
     exact_roots.sort_by(|left, right| {
@@ -586,11 +596,7 @@ fn extract_packages(
     let mut candidates = Vec::with_capacity(exact_roots.len());
     for root in exact_roots {
         work.charge()?;
-        let Some(value) = root.value() else {
-            return Err(PlanError::UnrealizedRoot {
-                root: budget.string(root.name())?,
-            });
-        };
+        let value = root.value();
         let mut candidate = decode_package(root.name(), value, &mut edge_count, &mut work, budget)?;
         if root.identity().path().len() == 1 {
             candidate.export = Some(root.name());
@@ -735,7 +741,7 @@ fn extract_packages(
 
 #[allow(clippy::too_many_lines)]
 fn extract_acquisitions(
-    realized: &RealizedProgram,
+    components: &[recipes::Component<'_>],
     packages: &[PlanPackage],
     standard_library: Option<&AuthenticatedStandardLibrary>,
     budget: &mut ProjectionBudget,
@@ -743,13 +749,11 @@ fn extract_acquisitions(
     if standard_library.is_none() {
         return Ok(Vec::new());
     }
-    let mut roots: Vec<_> = realized
-        .roots()
+    let mut roots: Vec<_> = components
+        .iter()
         .filter(|root| {
             root.identity().domain() == syrox_lang::SourceDomainId::project()
-                && root
-                    .ty()
-                    .is_some_and(|ty| exact_nominal(ty, ACQUISITION_PATH))
+                && exact_nominal(root.ty(), ACQUISITION_PATH)
         })
         .collect();
     roots.sort_by(|left, right| {
@@ -772,7 +776,7 @@ fn extract_acquisitions(
             root: root_name.clone(),
             reason,
         };
-        let Some(Value::Struct { ty, fields, .. }) = root.value() else {
+        let Value::Struct { ty, fields, .. } = root.value() else {
             return Err(malformed("value is not a struct"));
         };
         if !exact_nominal(ty, ACQUISITION_PATH)

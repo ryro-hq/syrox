@@ -315,6 +315,9 @@ impl<'a> Evaluator<'a> {
                     expression.span,
                 )
             }
+            ExpressionKind::ModuleExports { mapper, .. } => {
+                self.module_exports(mapper, substitutions, expression.span)
+            }
             ExpressionKind::Compare {
                 left,
                 right,
@@ -1225,6 +1228,47 @@ impl<'a> Evaluator<'a> {
             ty: target_ty,
             fields: projected,
             owner,
+        })
+    }
+
+    fn module_exports(
+        &mut self,
+        mapper: &Expression,
+        substitutions: &BTreeMap<LocalId, Ty>,
+        span: Span,
+    ) -> Eval<Value> {
+        let metadata = self.checked.expression(span).ok_or(Halt)?;
+        let Some(Elaboration::ModuleExports { key, function }) = metadata.elaboration() else {
+            return self.fail(span, "missing checked module collection metadata");
+        };
+        let entries = self.checked.resolved().module_exports(span).ok_or(Halt)?;
+        self.expand(entries.len().saturating_mul(size_of::<Value>()), span)?;
+        let callback = self.expression(mapper, substitutions)?;
+        let function = self.canonical_ty(function, substitutions, span)?;
+        let mut items = Vec::with_capacity(entries.len());
+        for entry in entries {
+            self.tick(span)?;
+            self.expand(
+                entry.key().len().saturating_add(2 * size_of::<Value>()),
+                span,
+            )?;
+            let key = self.construct_primitive(
+                *key,
+                PrimitiveValue::Str(entry.key().to_owned()),
+                span,
+                true,
+            )?;
+            let factory = Value::Function {
+                item: entry.item(),
+                ty: function.clone(),
+                substitutions: BTreeMap::new(),
+            };
+            let callable = Self::copy_value_ref(self, &callback, mapper.span, 0)?;
+            items.push(self.invoke_value(callable, vec![key, factory], span)?);
+        }
+        Ok(Value::List {
+            ty: self.canonical_ty(metadata.ty(), substitutions, span)?,
+            items,
         })
     }
 

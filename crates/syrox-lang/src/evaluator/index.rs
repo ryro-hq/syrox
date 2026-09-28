@@ -111,6 +111,7 @@ impl<'a> ProgramIndex<'a> {
         for expression in program.expressions() {
             budget.charge(0)?;
             index.intern_checked_type(expression.ty(), &mut budget)?;
+            index.intern_module_collection(program, expression, &mut budget)?;
             if let Some(Elaboration::Erasure { source }) = expression.elaboration() {
                 index.intern_checked_type(source, &mut budget)?;
             }
@@ -124,6 +125,28 @@ impl<'a> ProgramIndex<'a> {
             }
         }
         Ok(index)
+    }
+
+    fn intern_module_collection(
+        &mut self,
+        program: &CheckedProgram,
+        expression: &crate::CheckedExpression,
+        budget: &mut SetupBudget,
+    ) -> Result<(), EvaluationSetupError> {
+        if let Some(Elaboration::ModuleExports { function, .. }) = expression.elaboration() {
+            self.intern_checked_type(function, budget)?;
+            if let Some(entries) = program.resolved().module_exports(expression.span()) {
+                for entry in entries {
+                    budget.charge(
+                        entry
+                            .key()
+                            .len()
+                            .saturating_add(size_of::<crate::ResolvedModuleExport>()),
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn walk_items(

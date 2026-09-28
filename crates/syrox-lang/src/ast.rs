@@ -331,6 +331,11 @@ pub struct Expression {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExpressionKind {
+    ModuleExports {
+        namespace: Path,
+        export: Ident,
+        mapper: Box<Expression>,
+    },
     Compare {
         left: Box<Expression>,
         right: Box<Expression>,

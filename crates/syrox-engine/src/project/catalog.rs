@@ -71,29 +71,12 @@ fn add_factory(
     }
     let call = format!("{selected}::{function}()");
     if let Some((build, application)) = recipe {
-        exports.push((name.to_owned(), "Package".into(), format!("{call}.package")));
-        exports.push((
-            format!("{name}_sources"),
-            "Acquisition".into(),
-            format!("{call}.acquisition"),
-        ));
-        exports.push((
-            format!("{name}_build"),
-            build.into(),
-            format!("{call}.build"),
-        ));
-        if application {
-            exports.push((
-                format!("{name}_build_inputs"),
-                "BuildInputs".into(),
-                format!("{call}.build_inputs"),
-            ));
-            exports.push((
-                format!("{name}_application"),
-                "Application".into(),
-                format!("{call}.application"),
-            ));
-        }
+        let recipe = if application {
+            "ApplicationRecipe"
+        } else {
+            "Recipe"
+        };
+        exports.push((name.to_owned(), format!("{recipe}<std::{build}>"), call));
     } else if let Some(ty) = direct {
         exports.push((name.to_owned(), ty.to_owned(), call));
     }

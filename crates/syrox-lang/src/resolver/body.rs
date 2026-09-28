@@ -332,6 +332,14 @@ impl Resolver<'_> {
                     self.resolve_string(string, value_locals);
                 }
                 ExpressionKind::Path(path) => self.resolve_value_path(module, path, value_locals),
+                ExpressionKind::ModuleExports {
+                    namespace,
+                    export,
+                    mapper,
+                } => {
+                    self.resolve_module_exports(module, namespace, export, expression.span);
+                    stack.push(mapper);
+                }
                 ExpressionKind::Compare {
                     left,
                     right,

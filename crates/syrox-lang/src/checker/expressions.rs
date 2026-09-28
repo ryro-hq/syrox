@@ -258,6 +258,9 @@ impl Checker<'_> {
                 function,
                 arguments,
             } => self.check_function_specialization(function, arguments, &mut elaboration),
+            ExpressionKind::ModuleExports { mapper, .. } => {
+                self.check_module_exports(mapper, context, expression.span, &mut elaboration)
+            }
             ExpressionKind::Compare {
                 left,
                 right,

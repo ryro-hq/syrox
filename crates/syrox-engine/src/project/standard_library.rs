@@ -6,6 +6,10 @@ impl AuthenticatedStandardLibrary {
     pub fn bundled() -> Self {
         let sources = [
             ("std/main.srx", include_str!("../../../../std/main.srx")),
+            (
+                "std/catalog.srx",
+                include_str!("../../../../std/catalog.srx"),
+            ),
             ("std/option.srx", include_str!("../../../../std/option.srx")),
             ("std/result.srx", include_str!("../../../../std/result.srx")),
             (

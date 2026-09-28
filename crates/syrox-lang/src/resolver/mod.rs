@@ -5,6 +5,7 @@
 //! namespace before looking up references, so declaration order is irrelevant.
 
 mod body;
+mod collections;
 mod lookup;
 mod model;
 mod namespace;
@@ -69,6 +70,7 @@ pub(super) struct Resolver<'a> {
     pub(super) public_imports: BTreeSet<(ModuleId, String)>,
     pub(super) enum_variants: BTreeMap<ItemId, BTreeMap<String, u32>>,
     pub(super) references: Vec<ResolvedReference>,
+    pub(super) module_exports: BTreeMap<(usize, u32, u32), Vec<ResolvedModuleExport>>,
     pub(super) locals: Vec<ResolvedLocal>,
     pub(super) diagnostics: Vec<Diagnostic>,
     pub(super) work: usize,
@@ -96,6 +98,7 @@ pub fn resolve(parsed: ParsedSources) -> Result<ResolvedProgram, Vec<Diagnostic>
         let items = std::mem::take(&mut resolver.items);
         let references = std::mem::take(&mut resolver.references);
         let locals = std::mem::take(&mut resolver.locals);
+        let module_exports = std::mem::take(&mut resolver.module_exports);
         drop(resolver);
         Ok(ResolvedProgram {
             parsed,
@@ -103,6 +106,7 @@ pub fn resolve(parsed: ParsedSources) -> Result<ResolvedProgram, Vec<Diagnostic>
             items,
             references,
             locals,
+            module_exports,
         })
     } else {
         Err(std::mem::take(&mut resolver.diagnostics))
@@ -122,6 +126,7 @@ impl<'a> Resolver<'a> {
             public_imports: BTreeSet::new(),
             enum_variants: BTreeMap::new(),
             references: Vec::new(),
+            module_exports: BTreeMap::new(),
             locals: Vec::new(),
             diagnostics: Vec::new(),
             work: 0,

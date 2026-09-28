@@ -210,9 +210,34 @@ pub struct ResolvedProgram {
     pub(super) items: Vec<ResolvedItem>,
     pub(super) references: Vec<ResolvedReference>,
     pub(super) locals: Vec<ResolvedLocal>,
+    pub(super) module_exports:
+        std::collections::BTreeMap<(usize, u32, u32), Vec<ResolvedModuleExport>>,
+}
+
+/// A public function selected from an authenticated module namespace.
+/// Reexports retain the canonical item identity; keys describe the exporting module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedModuleExport {
+    pub(super) key: String,
+    pub(super) item: ItemId,
+}
+
+impl ResolvedModuleExport {
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+    pub const fn item(&self) -> ItemId {
+        self.item
+    }
 }
 
 impl ResolvedProgram {
+    pub fn module_exports(&self, span: Span) -> Option<&[ResolvedModuleExport]> {
+        self.module_exports
+            .get(&(span.source_id().index(), span.start(), span.end()))
+            .map(Vec::as_slice)
+    }
+
     pub const fn parsed(&self) -> &ParsedSources {
         &self.parsed
     }
