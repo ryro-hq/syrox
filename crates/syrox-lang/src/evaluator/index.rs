@@ -32,10 +32,9 @@ impl<'a> ProgramIndex<'a> {
     pub(super) fn new(
         program: &'a CheckedProgram,
         policy: &CheckPolicy,
-        limits: EvaluationLimits,
+        budget: &mut SetupBudget,
     ) -> Result<Self, EvaluationSetupError> {
         let resolved = program.resolved();
-        let mut budget = SetupBudget::new(limits);
         let mut index = Self {
             items: BTreeMap::new(),
             item_at: BTreeMap::new(),
@@ -106,21 +105,21 @@ impl<'a> ProgramIndex<'a> {
             index.locals.insert(span_key(local.span()), local.id());
         }
         for source in resolved.parsed().iter() {
-            index.walk_items(&source.program().items, &mut budget)?;
+            index.walk_items(&source.program().items, budget)?;
         }
         for expression in program.expressions() {
             budget.charge(0)?;
-            index.intern_checked_type(expression.ty(), &mut budget)?;
-            index.intern_module_collection(program, expression, &mut budget)?;
+            index.intern_checked_type(expression.ty(), budget)?;
+            index.intern_module_collection(program, expression, budget)?;
             if let Some(Elaboration::Erasure { source }) = expression.elaboration() {
-                index.intern_checked_type(source, &mut budget)?;
+                index.intern_checked_type(source, budget)?;
             }
             if let Some(Elaboration::FunctionSpecialization { substitutions }) =
                 expression.elaboration()
             {
                 for ty in substitutions.values() {
                     budget.charge(0)?;
-                    index.intern_checked_type(ty, &mut budget)?;
+                    index.intern_checked_type(ty, budget)?;
                 }
             }
         }
@@ -222,7 +221,7 @@ impl<'a> ProgramIndex<'a> {
         Ok(())
     }
 
-    fn item_at(&self, span: Span) -> Option<ItemId> {
+    pub(super) fn item_at(&self, span: Span) -> Option<ItemId> {
         self.item_at.get(&span_key(span)).copied()
     }
 
@@ -350,14 +349,14 @@ impl<'a> ProgramIndex<'a> {
     }
 }
 
-struct SetupBudget {
+pub(super) struct SetupBudget {
     limits: EvaluationLimits,
     steps: usize,
     bytes: usize,
 }
 
 impl SetupBudget {
-    const fn new(limits: EvaluationLimits) -> Self {
+    pub(super) const fn new(limits: EvaluationLimits) -> Self {
         Self {
             limits,
             steps: 0,
@@ -365,7 +364,7 @@ impl SetupBudget {
         }
     }
 
-    fn charge(&mut self, bytes: usize) -> Result<(), EvaluationSetupError> {
+    pub(super) fn charge(&mut self, bytes: usize) -> Result<(), EvaluationSetupError> {
         self.steps = self.steps.saturating_add(1);
         if self.steps > self.limits.max_setup_steps {
             return Err(EvaluationSetupError::SetupWorkLimit);

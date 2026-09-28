@@ -481,6 +481,23 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    pub(super) fn root_value(&mut self, item: ItemId, expression: &Expression) -> Eval<Value> {
+        if self.memo_outputs.contains_key(&item) {
+            return self.output_value(item, expression.span);
+        }
+        self.expand(size_of::<ItemId>(), expression.span)?;
+        self.active_outputs.insert(item);
+        let result = self.expression(expression, &BTreeMap::new());
+        self.active_outputs.remove(&item);
+        let value = result?;
+        if !value.affine() && self.claims.is_empty() && self.diagnostics.is_empty() {
+            self.expand(size_of::<(ItemId, Value)>(), expression.span)?;
+            let copy = Self::copy_value_ref(self, &value, expression.span, 0)?;
+            self.memo_outputs.insert(item, copy);
+        }
+        Ok(value)
+    }
+
     fn output_value(&mut self, item: ItemId, span: Span) -> Eval<Value> {
         if let Some(value) = self.memo_outputs.remove(&item) {
             let result = Self::copy_value_ref(self, &value, span, 0);

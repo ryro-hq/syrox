@@ -20,6 +20,7 @@ use super::loader::{
 use super::*;
 use crate::linux_fd::OpenError;
 
+mod evaluation;
 mod package_set;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);

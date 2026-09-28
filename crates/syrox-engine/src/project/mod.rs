@@ -3,6 +3,10 @@ mod analyze;
 #[cfg(target_os = "linux")]
 mod catalog;
 #[cfg(target_os = "linux")]
+mod evaluation;
+#[cfg(target_os = "linux")]
+pub use evaluation::{LockedProject, ProjectEvaluation, open_locked_project_with};
+#[cfg(target_os = "linux")]
 mod loader;
 #[cfg(target_os = "linux")]
 mod locator;
@@ -357,6 +361,8 @@ pub enum LockCleanupError {
 
 #[derive(Debug, Error)]
 pub enum ProjectOperationError {
+    #[error("project has no value output `{name}`")]
+    MissingOutput { name: String },
     #[error(transparent)]
     Check(#[from] CheckFailure),
     #[error("project has no {name}")]
@@ -575,6 +581,30 @@ pub fn plan_project_with(
     plan_project_platform(path, configuration)
 }
 
+/// Project only the requested top-level value outputs from one verified
+/// snapshot. Repeated names select the same root; dependencies expressed as
+/// value references remain lazy. Package-name dependency expansion is separate.
+pub fn plan_project_outputs_with(
+    path: &Path,
+    configuration: &CheckConfiguration,
+    outputs: &[&str],
+) -> Result<crate::Plan, ProjectOperationError> {
+    #[cfg(target_os = "linux")]
+    {
+        let project = open_locked_project_with(path, configuration)?;
+        let mut evaluation = project.evaluation()?;
+        for output in outputs {
+            evaluation.evaluate_root(output)?;
+        }
+        evaluation.into_plan()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, configuration, outputs);
+        Err(CheckFailure::UnsupportedPlatform.into())
+    }
+}
+
 /// Compatibility entrypoint for callers that check one source file.
 pub fn check_file(path: &Path) -> Result<CheckReport, CheckFailure> {
     check_file_with(path, &CheckConfiguration::default())
@@ -681,10 +711,10 @@ fn check_file_platform(
 
 #[cfg(target_os = "linux")]
 fn expected_lock(
-    validated: &ValidatedProject,
+    loaded: &LoadedProject,
     configuration: &CheckConfiguration,
 ) -> Result<crate::lock::LockManifest, ProjectOperationError> {
-    crate::lock::LockManifest::generate(validated.loaded(), configuration.standard_library.as_ref())
+    crate::lock::LockManifest::generate(loaded, configuration.standard_library.as_ref())
         .map_err(map_generated_lock_error)
 }
 
@@ -806,10 +836,11 @@ fn lock_project_platform(
     path: &Path,
     configuration: &CheckConfiguration,
 ) -> Result<LockReport, ProjectOperationError> {
-    let validated = loader::validate_project_linux(path, configuration)?;
-    let expected = expected_lock(&validated, configuration)?;
-    let existing = read_lock(validated.loaded())?;
-    let old_graph = read_graph_lock(validated.loaded())?;
+    let loaded = loader::load_project_linux(path, configuration)?;
+    let checked = analyze::check_loaded(&loaded, configuration)?;
+    let expected = expected_lock(&loaded, configuration)?;
+    let existing = read_lock(&loaded)?;
+    let old_graph = read_graph_lock(&loaded)?;
     let status = match (&existing, &old_graph) {
         (None, _) => crate::LockStatus::Created,
         (Some(existing), None) if existing.data() == expected.data() => {
@@ -819,30 +850,32 @@ fn lock_project_platform(
     };
     if status != crate::LockStatus::Unchanged {
         crate::linux_fd::write_atomic_beneath(
-            validated.loaded.root.fd(),
+            loaded.root.fd(),
             Path::new(crate::LOCK_FILE_NAME),
             expected.data(),
         )
         .map_err(map_lock_publication)?;
     }
     if old_graph.is_some() {
-        let opened = crate::linux_fd::open_existing_regular(
-            validated.loaded.root.fd(),
-            Path::new(GRAPH_LOCK_FILE),
-        )
-        .map_err(|source| ProjectOperationError::GraphRemoval { source })?;
+        let opened =
+            crate::linux_fd::open_existing_regular(loaded.root.fd(), Path::new(GRAPH_LOCK_FILE))
+                .map_err(|source| ProjectOperationError::GraphRemoval { source })?;
         crate::linux_fd::unlink_opened(
-            validated.loaded.root.fd(),
+            loaded.root.fd(),
             Path::new(GRAPH_LOCK_FILE),
             opened.metadata().identity(),
         )
         .map_err(|source| ProjectOperationError::GraphRemoval { source })?;
-        crate::linux_fd::sync_directory(validated.loaded.root.fd())
+        crate::linux_fd::sync_directory(loaded.root.fd())
             .map_err(|source| ProjectOperationError::GraphRemoval { source })?;
     }
     Ok(LockReport {
         status,
-        check: validated.report(),
+        check: CheckReport {
+            path: loaded.path.clone(),
+            declarations: checked.resolved().parsed().declaration_count(),
+            realized_roots: 0,
+        },
         digest: *expected.digest(),
     })
 }
@@ -860,19 +893,11 @@ fn check_project_lock_platform(
     path: &Path,
     configuration: &CheckConfiguration,
 ) -> Result<LockReport, ProjectOperationError> {
-    let validated = loader::validate_project_linux(path, configuration)?;
-    let expected = expected_lock(&validated, configuration)?;
-    let actual = read_lock(validated.loaded())?.ok_or(ProjectOperationError::MissingLock {
-        name: crate::LOCK_FILE_NAME,
-    })?;
-    compare_lock(&actual, &expected)?;
-    if read_graph_lock(validated.loaded())?.is_some() {
-        return Err(ProjectOperationError::GraphDrift);
-    }
+    let project = open_locked_project_with(path, configuration)?;
     Ok(LockReport {
         status: crate::LockStatus::Unchanged,
-        check: validated.report(),
-        digest: *actual.digest(),
+        check: project.check_report(),
+        digest: *project.lock_digest(),
     })
 }
 
@@ -889,29 +914,29 @@ fn plan_project_platform(
     path: &Path,
     configuration: &CheckConfiguration,
 ) -> Result<crate::Plan, ProjectOperationError> {
-    let validated = loader::validate_project_linux(path, configuration)?;
-    let expected = expected_lock(&validated, configuration)?;
-    let actual = read_lock(validated.loaded())?.ok_or(ProjectOperationError::MissingLock {
-        name: crate::LOCK_FILE_NAME,
-    })?;
-    compare_lock(&actual, &expected)?;
-    if read_graph_lock(validated.loaded())?.is_some() {
-        return Err(ProjectOperationError::GraphDrift);
-    }
+    let project = open_locked_project_with(path, configuration)?;
+    let mut evaluation = project.evaluation()?;
+    evaluation.evaluate_all()?;
+    evaluation.into_plan()
+}
+
+#[cfg(target_os = "linux")]
+fn project_plan(
+    loaded: &LoadedProject,
+    realized: &RealizedProgram,
+    digest: [u8; 32],
+    configuration: &CheckConfiguration,
+) -> Result<crate::Plan, ProjectOperationError> {
+    analyze::require_success(loaded, realized)?;
     let mut plan = crate::Plan::from_realized(
-        validated.realized(),
-        *actual.digest(),
+        realized,
+        digest,
         configuration.policy.identity(),
         configuration.standard_library.as_ref(),
     )
     .map_err(ProjectOperationError::from)?;
     let mut roots = BTreeMap::new();
-    collect_project_roots(
-        validated.loaded(),
-        validated.loaded(),
-        SourceDomainId::project(),
-        &mut roots,
-    );
+    collect_project_roots(loaded, loaded, SourceDomainId::project(), &mut roots);
     for source in plan
         .acquisitions()
         .flat_map(crate::PlanAcquisition::sources)

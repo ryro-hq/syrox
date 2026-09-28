@@ -71,8 +71,11 @@ pub use project::{
     MAX_PROJECT_BYTES, MAX_PROJECT_WORK, ProjectLimits, ProjectOperationError,
     StandardLibraryError, ValidatedProject, check_file, check_path, check_path_with, check_project,
     check_project_lock, check_project_lock_with, check_project_with, lock_project,
-    lock_project_with, plan_project, plan_project_with, validate_project, validate_project_with,
+    lock_project_with, plan_project, plan_project_outputs_with, plan_project_with,
+    validate_project, validate_project_with,
 };
+#[cfg(target_os = "linux")]
+pub use project::{LockedProject, ProjectEvaluation, open_locked_project_with};
 #[cfg(target_os = "linux")]
 pub use realize::{
     ApplicationError, ResolvedApplication, realize_application, resolve_application,
