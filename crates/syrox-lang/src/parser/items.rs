@@ -38,7 +38,9 @@ impl Parser<'_> {
 
     fn parse_item_inner(&mut self) -> Option<Item> {
         let token = self.advance()?;
-        let TokenKind::Keyword(keyword) = token.kind else {
+        let public = token.kind == TokenKind::Keyword(Keyword::Pub);
+        let declaration = if public { self.advance()? } else { token };
+        let TokenKind::Keyword(keyword) = declaration.kind else {
             self.error(
                 Diagnostic::error("expected a declaration", token.span).with_note(
                     "declarations start with mod, use, inputs, outputs, type, struct, opaque, enum, resource, value or fn",
@@ -46,6 +48,25 @@ impl Parser<'_> {
             );
             return None;
         };
+        if public
+            && !matches!(
+                keyword,
+                Keyword::Fn
+                    | Keyword::Struct
+                    | Keyword::Type
+                    | Keyword::Enum
+                    | Keyword::Value
+                    | Keyword::Resource
+                    | Keyword::Opaque
+                    | Keyword::Use
+            )
+        {
+            self.error(Diagnostic::error(
+                "`pub` requires a type, value, function or import declaration",
+                declaration.span,
+            ));
+            return None;
+        }
         let start = token.span;
         let (kind, end) = match keyword {
             Keyword::Mod => self.parse_module(start)?,
@@ -69,6 +90,7 @@ impl Parser<'_> {
         };
         Some(Item {
             kind,
+            public,
             span: start.join(end),
         })
     }
@@ -204,10 +226,22 @@ impl Parser<'_> {
 
     fn parse_type_alias(&mut self, _start: Span) -> Option<(ItemKind, Span)> {
         let name = self.ident("expected type alias name")?;
+        let type_parameters = if self.at(TokenKind::LeftAngle) {
+            self.parse_type_parameters()?
+        } else {
+            Vec::new()
+        };
         self.expect(TokenKind::Equal, "expected `=` after type alias name")?;
         let ty = self.parse_type()?;
         let end = self.expect(TokenKind::Semicolon, "expected `;` after type alias")?;
-        Some((ItemKind::TypeAlias(TypeAlias { name, ty }), end.span))
+        Some((
+            ItemKind::TypeAlias(TypeAlias {
+                name,
+                type_parameters,
+                ty,
+            }),
+            end.span,
+        ))
     }
 
     fn parse_struct(&mut self, _start: Span, opaque: bool) -> Option<(ItemKind, Span)> {
@@ -302,18 +336,48 @@ impl Parser<'_> {
 
     fn parse_enum(&mut self, _start: Span) -> Option<(ItemKind, Span)> {
         let name = self.ident("expected enum name")?;
+        let type_parameters = if self.at(TokenKind::LeftAngle) {
+            self.parse_type_parameters()?
+        } else {
+            Vec::new()
+        };
         let open = self.expect(TokenKind::LeftBrace, "expected `{` before enum variants")?;
         if !self.enter(open.span) {
             return None;
         }
-        let variants = self.comma_idents(TokenKind::RightBrace, true);
+        let mut variants = Vec::new();
+        while !self.at(TokenKind::RightBrace) {
+            let name = self.ident("expected enum variant name")?;
+            let payload = if let Some(open) = self.consume(TokenKind::LeftParen) {
+                if !self.enter(open.span) {
+                    return None;
+                }
+                let payload = if self.at(TokenKind::RightParen) {
+                    Some(Vec::new())
+                } else {
+                    self.comma_types(TokenKind::RightParen, true)
+                };
+                let close =
+                    self.expect(TokenKind::RightParen, "expected `)` after variant payload");
+                self.leave();
+                close?;
+                payload?
+            } else {
+                Vec::new()
+            };
+            variants.push(crate::ast::EnumVariant { name, payload });
+            if self.consume(TokenKind::Comma).is_none() {
+                break;
+            }
+        }
         let close = self.expect(TokenKind::RightBrace, "expected `}` after enum variants");
         self.leave();
         let close = close?;
         Some((
             ItemKind::Enum(Enum {
                 name,
-                variants: variants?,
+                type_parameters,
+                variants,
             }),
             close.span,
         ))
@@ -446,6 +510,11 @@ impl Parser<'_> {
 
     fn parse_function(&mut self, _start: Span) -> Option<(ItemKind, Span)> {
         let name = self.ident("expected function name")?;
+        let type_parameters = if self.at(TokenKind::LeftAngle) {
+            self.parse_type_parameters()?
+        } else {
+            Vec::new()
+        };
         let open = self.expect(TokenKind::LeftParen, "expected `(` after function name")?;
         if !self.enter(open.span) {
             return None;
@@ -480,6 +549,7 @@ impl Parser<'_> {
         Some((
             ItemKind::Function(Function {
                 name,
+                type_parameters,
                 parameters,
                 result,
                 body,
@@ -488,7 +558,7 @@ impl Parser<'_> {
         ))
     }
 
-    fn parse_block(&mut self) -> Option<Block> {
+    pub(super) fn parse_block(&mut self) -> Option<Block> {
         let open = self.expect(TokenKind::LeftBrace, "expected function body")?;
         if !self.enter(open.span) {
             return None;
@@ -530,16 +600,49 @@ impl Parser<'_> {
     }
 
     pub(super) fn parse_type(&mut self) -> Option<Type> {
+        let once = self.consume_keyword(Keyword::Once);
+        if once.is_some() && !self.at_keyword(Keyword::Fn) {
+            self.expect_keyword(Keyword::Fn, "expected `fn` after `once`")?;
+        }
+        if let Some(start) = self.consume_keyword(Keyword::Fn) {
+            let open = self.expect(TokenKind::LeftParen, "expected `(` after `fn` type")?;
+            if !self.enter(open.span) {
+                return None;
+            }
+            let parameters = if self.at(TokenKind::RightParen) {
+                Some(Vec::new())
+            } else {
+                self.comma_types(TokenKind::RightParen, false)
+            };
+            let close = self.expect(
+                TokenKind::RightParen,
+                "expected `)` after function parameters",
+            );
+            self.leave();
+            close?;
+            self.expect(TokenKind::Arrow, "expected `->` after function parameters")?;
+            let result = self.parse_type()?;
+            return Some(Type {
+                span: once
+                    .map_or(start.span, |token| token.span)
+                    .join(result.span),
+                kind: TypeKind::Function {
+                    once: once.is_some(),
+                    parameters: parameters?,
+                    result: Box::new(result),
+                },
+            });
+        }
         if let Some(open) = self.consume(TokenKind::LeftBracket) {
             if !self.enter(open.span) {
                 return None;
             }
-            let path = self.parse_path("expected path in list type")?;
+            let element = self.parse_type()?;
             let close = self.expect(TokenKind::RightBracket, "expected `]` after list type");
             self.leave();
             let close = close?;
             return Some(Type {
-                kind: TypeKind::List(path),
+                kind: TypeKind::List(Box::new(element)),
                 span: open.span.join(close.span),
             });
         }

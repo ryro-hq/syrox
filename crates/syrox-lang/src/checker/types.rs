@@ -12,19 +12,30 @@ impl Checker<'_> {
             .map(|(&id, info)| (id, *info))
             .collect();
         for (id, info) in functions {
+            let types = self.function_parameters(id);
             let parameters = info
                 .declaration
                 .parameters
                 .iter()
-                .map(|parameter| self.resolve_type(&parameter.ty, &BTreeMap::new(), 0))
+                .map(|parameter| self.resolve_type(&parameter.ty, &types, 0))
                 .collect();
             let result = info
                 .declaration
                 .result
                 .as_ref()
-                .map_or(Ty::Unit, |ty| self.resolve_type(ty, &BTreeMap::new(), 0));
+                .map_or(Ty::Unit, |ty| self.resolve_type(ty, &types, 0));
             self.function_types.insert(id, (parameters, result));
         }
+    }
+
+    pub(super) fn function_parameters(&self, item: ItemId) -> BTreeMap<LocalId, Ty> {
+        self.functions
+            .get(&item)
+            .into_iter()
+            .flat_map(|info| &info.declaration.type_parameters)
+            .filter_map(|parameter| self.local_id(parameter.name.span))
+            .map(|local| (local, Ty::Parameter(local)))
+            .collect()
     }
 
     pub(super) fn resolve_type(
@@ -63,15 +74,32 @@ impl Checker<'_> {
             return RawTy::Concrete(Ty::Error);
         }
         match &ty.kind {
-            TypeKind::List(path) => {
-                let element = self.resolve_named(path, &[], params, depth, aliases);
+            TypeKind::Function {
+                parameters,
+                result,
+                once,
+            } => RawTy::Function {
+                once: *once,
+                parameters: parameters
+                    .iter()
+                    .map(|parameter| {
+                        self.resolve_raw_type_with_aliases(parameter, params, depth + 1, aliases)
+                    })
+                    .collect(),
+                result: Box::new(self.resolve_raw_type_with_aliases(
+                    result,
+                    params,
+                    depth + 1,
+                    aliases,
+                )),
+            },
+            TypeKind::List(inner) => {
+                let element = self.resolve_raw_type_with_aliases(inner, params, depth + 1, aliases);
                 if matches!(element, RawTy::Concrete(Ty::Error)) {
                     return element;
                 }
-                if matches!(element, RawTy::List(_))
-                    || matches!(&element, RawTy::Concrete(element) if !element.scalar())
-                {
-                    self.error("lists cannot contain lists or `unit`", ty.span);
+                if matches!(&element, RawTy::Concrete(Ty::Unit)) {
+                    self.error("lists cannot contain `unit`", ty.span);
                     RawTy::Concrete(Ty::Error)
                 } else {
                     RawTy::List(Box::new(element))
@@ -147,28 +175,52 @@ impl Checker<'_> {
         span: Span,
         aliases: &mut BTreeSet<ItemId>,
     ) -> RawTy {
-        if !arguments.is_empty() && self.aliases.contains_key(&item) {
-            self.error("type aliases cannot take type arguments", span);
-            return RawTy::Concrete(Ty::Error);
-        }
         let mut inserted = Vec::new();
         // A loop keeps long simple alias chains off the call stack. Keep their
         // identities live across recursive list/generic branches, then release
         // only the aliases owned by this expansion on every return path.
         let result = (|| {
-            while let Some(alias) = self.aliases.get(&item).copied() {
+            while let Some(alias) = self.aliases.get(&item).cloned() {
+                if arguments.len() != alias.parameters.len() {
+                    self.error(
+                        format!(
+                            "generic alias expects {} type argument(s), found {}",
+                            alias.parameters.len(),
+                            arguments.len()
+                        ),
+                        span,
+                    );
+                    return RawTy::Concrete(Ty::Error);
+                }
                 if !aliases.insert(item) {
-                    self.error("cyclic type alias", alias.name.span);
+                    self.error("cyclic type alias", alias.declaration.name.span);
                     return RawTy::Concrete(Ty::Error);
                 }
                 inserted.push(item);
-                if aliases.len() > self.limits.max_alias_depth || !self.charge(alias.ty.span) {
-                    self.error("type alias expansion depth limit reached", alias.ty.span);
+                if aliases.len() > self.limits.max_alias_depth
+                    || !self.charge(alias.declaration.ty.span)
+                {
+                    self.error(
+                        "type alias expansion depth limit reached",
+                        alias.declaration.ty.span,
+                    );
                     return RawTy::Concrete(Ty::Error);
                 }
-                match &alias.ty.kind {
-                    TypeKind::List(path) => {
-                        let element = self.resolve_named(path, &[], params, depth, aliases);
+                if !alias.parameters.is_empty() {
+                    return self.expand_generic_alias(&alias, arguments, params, depth, aliases);
+                }
+                match &alias.declaration.ty.kind {
+                    TypeKind::Function { .. } => {
+                        return self.resolve_raw_type_with_aliases(
+                            &alias.declaration.ty,
+                            params,
+                            depth + 1,
+                            aliases,
+                        );
+                    }
+                    TypeKind::List(inner) => {
+                        let element =
+                            self.resolve_raw_type_with_aliases(inner, params, depth + 1, aliases);
                         return if matches!(element, RawTy::Concrete(Ty::Error)) {
                             element
                         } else {
@@ -201,54 +253,78 @@ impl Checker<'_> {
                     }
                 }
             }
-            let Some(kind) = self.item_kind(item) else {
-                return RawTy::Concrete(Ty::Error);
-            };
-            if kind != ResolvedItemKind::Struct {
-                if !arguments.is_empty() {
-                    self.error("only structs can take type arguments", span);
-                    return RawTy::Concrete(Ty::Error);
-                }
-                return RawTy::Concrete(Ty::Nominal(item));
-            }
-            let arity = self
-                .structs
-                .get(&item)
-                .map_or(0, |info| info.parameters.len());
-            if arguments.len() != arity {
-                self.error(
-                    format!(
-                        "generic struct expects {arity} type argument(s), found {}",
-                        arguments.len()
-                    ),
-                    span,
-                );
-                return RawTy::Concrete(Ty::Error);
-            }
-            if arity == 0 {
-                return RawTy::Concrete(Ty::Nominal(item));
-            }
-            let mut checked = Vec::with_capacity(arguments.len());
-            for argument in arguments {
-                let checked_argument =
-                    self.resolve_raw_type_with_aliases(argument, params, depth + 1, aliases);
-                if !raw_scalar(&checked_argument) {
-                    self.error(
-                        "generic arguments must be concrete scalar types",
-                        argument.span,
-                    );
-                }
-                checked.push(checked_argument);
-            }
-            RawTy::Specialization {
-                template: item,
-                arguments: checked,
-            }
+            self.specialize_item(item, arguments, params, depth, span, aliases)
         })();
         for item in inserted {
             aliases.remove(&item);
         }
         result
+    }
+
+    fn specialize_item(
+        &mut self,
+        item: ItemId,
+        arguments: &[Type],
+        params: &BTreeMap<LocalId, RawTy>,
+        depth: usize,
+        span: Span,
+        aliases: &mut BTreeSet<ItemId>,
+    ) -> RawTy {
+        let Some(kind) = self.item_kind(item) else {
+            return RawTy::Concrete(Ty::Error);
+        };
+        if !matches!(kind, ResolvedItemKind::Struct | ResolvedItemKind::Enum) {
+            if !arguments.is_empty() {
+                self.error("only structs and enums can take type arguments", span);
+                return RawTy::Concrete(Ty::Error);
+            }
+            return RawTy::Concrete(Ty::Nominal(item));
+        }
+        let arity = self.nominal_parameters(item).len();
+        if arguments.len() != arity {
+            self.error(
+                format!(
+                    "generic type expects {arity} type argument(s), found {}",
+                    arguments.len()
+                ),
+                span,
+            );
+            return RawTy::Concrete(Ty::Error);
+        }
+        if arity == 0 {
+            return RawTy::Concrete(Ty::Nominal(item));
+        }
+        let mut checked = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            let checked_argument =
+                self.resolve_raw_type_with_aliases(argument, params, depth + 1, aliases);
+            checked.push(checked_argument);
+        }
+        RawTy::Specialization {
+            template: item,
+            arguments: checked,
+        }
+    }
+
+    fn expand_generic_alias(
+        &mut self,
+        alias: &super::AliasInfo<'_>,
+        arguments: &[Type],
+        params: &BTreeMap<LocalId, RawTy>,
+        depth: usize,
+        aliases: &mut BTreeSet<ItemId>,
+    ) -> RawTy {
+        let mut substitutions = BTreeMap::new();
+        for (parameter, argument) in alias.parameters.iter().zip(arguments) {
+            let raw = self.resolve_raw_type_with_aliases(argument, params, depth + 1, aliases);
+            substitutions.insert(*parameter, raw);
+        }
+        self.resolve_raw_type_with_aliases(
+            &alias.declaration.ty,
+            &substitutions,
+            depth + 1,
+            aliases,
+        )
     }
 
     pub(super) fn project(&mut self, ty: &Ty, field: &str, span: Span) -> Ty {
@@ -290,16 +366,12 @@ impl Checker<'_> {
         item: ItemId,
         ty: &Ty,
     ) -> BTreeMap<LocalId, Ty> {
-        let Some(info) = self.structs.get(&item) else {
-            return BTreeMap::new();
-        };
         let arguments = match ty {
             Ty::Specialization { arguments, .. } => arguments.as_slice(),
             _ => &[],
         };
-        info.parameters
-            .iter()
-            .copied()
+        self.nominal_parameters(item)
+            .into_iter()
             .zip(arguments.iter().cloned())
             .collect()
     }
@@ -355,7 +427,20 @@ impl Checker<'_> {
                     self.validate_concrete_type(argument, span);
                 }
             }
-            Ty::List(element) => self.validate_concrete_type(element, span),
+            Ty::List(element) => {
+                if matches!(element.as_ref(), Ty::Unit) {
+                    self.error("lists cannot contain `unit`", span);
+                }
+                self.validate_concrete_type(element, span);
+            }
+            Ty::Function {
+                parameters, result, ..
+            } => {
+                for parameter in parameters {
+                    self.validate_concrete_type(parameter, span);
+                }
+                self.validate_concrete_type(result, span);
+            }
             Ty::Unit | Ty::Int | Ty::Str | Ty::Parameter(_) | Ty::Nominal(_) | Ty::Error => {}
         }
     }
@@ -396,6 +481,12 @@ impl Checker<'_> {
             match node {
                 Node::Raw(RawTy::Concrete(ty)) => match ty {
                     Ty::List(inner) => pending.push(Node::Concrete(inner)),
+                    Ty::Function {
+                        parameters, result, ..
+                    } => {
+                        pending.push(Node::Concrete(result));
+                        pending.extend(parameters.iter().map(Node::Concrete));
+                    }
                     Ty::Specialization { arguments, .. } => {
                         pending.extend(arguments.iter().map(Node::Concrete));
                     }
@@ -408,7 +499,19 @@ impl Checker<'_> {
                     pending.extend(arguments.iter().map(Node::Raw));
                 }
                 Node::Raw(RawTy::List(inner)) => pending.push(Node::Raw(inner)),
+                Node::Raw(RawTy::Function {
+                    parameters, result, ..
+                }) => {
+                    pending.push(Node::Raw(result));
+                    pending.extend(parameters.iter().map(Node::Raw));
+                }
                 Node::Concrete(Ty::List(inner)) => pending.push(Node::Concrete(inner)),
+                Node::Concrete(Ty::Function {
+                    parameters, result, ..
+                }) => {
+                    pending.push(Node::Concrete(result));
+                    pending.extend(parameters.iter().map(Node::Concrete));
+                }
                 Node::Concrete(Ty::Specialization { arguments, .. }) => {
                     pending.extend(arguments.iter().map(Node::Concrete));
                 }
@@ -440,6 +543,14 @@ impl Checker<'_> {
                 }
             }
             Ty::List(element) => self.track_generic_instances(element, span),
+            Ty::Function {
+                parameters, result, ..
+            } => {
+                for parameter in parameters {
+                    self.track_generic_instances(parameter, span);
+                }
+                self.track_generic_instances(result, span);
+            }
             Ty::Unit | Ty::Int | Ty::Str | Ty::Parameter(_) | Ty::Nominal(_) | Ty::Error => {}
         }
     }
@@ -449,7 +560,7 @@ impl Checker<'_> {
             .get(&enumeration)?
             .variants
             .iter()
-            .position(|variant| variant.text == name)
+            .position(|variant| variant.name.text == name)
             .and_then(|index| u32::try_from(index).ok())
     }
 
@@ -532,11 +643,24 @@ pub(super) fn concretize(raw: RawTy, params: &BTreeMap<LocalId, Ty>) -> Option<T
                 arguments,
             }),
         RawTy::List(element) => concretize(*element, params).map(|ty| Ty::List(Box::new(ty))),
+        RawTy::Function {
+            parameters,
+            result,
+            once,
+        } => Some(Ty::Function {
+            once,
+            parameters: parameters
+                .into_iter()
+                .map(|ty| concretize(ty, params))
+                .collect::<Option<Vec<_>>>()?,
+            result: Box::new(concretize(*result, params)?),
+        }),
     }
 }
 
 pub(super) fn raw_from_ty(ty: Ty) -> RawTy {
     match ty {
+        Ty::Parameter(parameter) => RawTy::Parameter(parameter),
         Ty::Specialization {
             template,
             arguments,
@@ -545,6 +669,15 @@ pub(super) fn raw_from_ty(ty: Ty) -> RawTy {
             arguments: arguments.into_iter().map(raw_from_ty).collect(),
         },
         Ty::List(element) => RawTy::List(Box::new(raw_from_ty(*element))),
+        Ty::Function {
+            parameters,
+            result,
+            once,
+        } => RawTy::Function {
+            once,
+            parameters: parameters.into_iter().map(raw_from_ty).collect(),
+            result: Box::new(raw_from_ty(*result)),
+        },
         ty => RawTy::Concrete(ty),
     }
 }
@@ -554,15 +687,10 @@ pub(super) fn ty_contains_parameter(ty: &Ty) -> bool {
         Ty::Parameter(_) => true,
         Ty::Specialization { arguments, .. } => arguments.iter().any(ty_contains_parameter),
         Ty::List(element) => ty_contains_parameter(element),
+        Ty::Function {
+            parameters, result, ..
+        } => parameters.iter().any(ty_contains_parameter) || ty_contains_parameter(result),
         Ty::Unit | Ty::Int | Ty::Str | Ty::Nominal(_) | Ty::Error => false,
-    }
-}
-
-pub(super) fn raw_scalar(raw: &RawTy) -> bool {
-    match raw {
-        RawTy::Concrete(ty) => ty.scalar(),
-        RawTy::Parameter(_) | RawTy::Specialization { .. } => true,
-        RawTy::List(_) => false,
     }
 }
 
@@ -570,13 +698,16 @@ pub(super) fn nominal_head(ty: &Ty) -> Option<ItemId> {
     match ty {
         Ty::Nominal(item) => Some(*item),
         Ty::Specialization { template, .. } => Some(*template),
-        Ty::Unit | Ty::Int | Ty::Str | Ty::Parameter(_) | Ty::List(_) | Ty::Error => None,
+        Ty::Unit
+        | Ty::Int
+        | Ty::Str
+        | Ty::Parameter(_)
+        | Ty::List(_)
+        | Ty::Function { .. }
+        | Ty::Error => None,
     }
 }
 
 pub(super) fn nominal_enum(ty: &Ty) -> Option<ItemId> {
-    match ty {
-        Ty::Nominal(item) => Some(*item),
-        _ => None,
-    }
+    nominal_head(ty)
 }

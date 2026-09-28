@@ -15,21 +15,14 @@ impl Checker<'_> {
             .collect();
         for (container, fields) in fields {
             let mut seeded = false;
-            for (_, field, _) in fields {
-                if !self.charge(self.item_span(container)) {
-                    return;
-                }
-                match field {
-                    RawTy::Concrete(ty) => {
-                        if self.ty_directly_claims(&ty) {
-                            seeded = true;
-                        }
-                        if let Some(dependency) = nominal_head(&ty) {
-                            reverse.entry(dependency).or_default().push(container);
-                        }
+            for (_, field, _) in &fields {
+                let mut pending = vec![field];
+                while let Some(field) = pending.pop() {
+                    if !self.charge(self.item_span(container)) {
+                        return;
                     }
-                    RawTy::List(element) => {
-                        if let RawTy::Concrete(ty) = element.as_ref() {
+                    match field {
+                        RawTy::Concrete(ty) => {
                             if self.ty_directly_claims(ty) {
                                 seeded = true;
                             }
@@ -37,11 +30,13 @@ impl Checker<'_> {
                                 reverse.entry(dependency).or_default().push(container);
                             }
                         }
+                        RawTy::List(element) => pending.push(element),
+                        RawTy::Specialization { template, .. } => {
+                            reverse.entry(*template).or_default().push(container);
+                        }
+                        RawTy::Function { once: true, .. } => seeded = true,
+                        RawTy::Parameter(_) | RawTy::Function { once: false, .. } => {}
                     }
-                    RawTy::Specialization { template, .. } => {
-                        reverse.entry(template).or_default().push(container);
-                    }
-                    RawTy::Parameter(_) => {}
                 }
             }
             if seeded && self.carriers.insert(container) {
@@ -135,10 +130,8 @@ impl Checker<'_> {
                     true
                 } else {
                     let substitutions: BTreeMap<_, _> = self
-                        .structs
-                        .get(template)
+                        .nominal_parameters(*template)
                         .into_iter()
-                        .flat_map(|info| info.parameters.iter().copied())
                         .zip(arguments.iter().cloned())
                         .collect();
                     let fields = self
@@ -155,7 +148,9 @@ impl Checker<'_> {
                 }
             }
             Ty::List(element) => self.affine_inner(element, span, visiting, memo, depth + 1),
-            Ty::Unit | Ty::Int | Ty::Str | Ty::Parameter(_) | Ty::Error => false,
+            Ty::Parameter(_) => true,
+            Ty::Function { once, .. } => *once,
+            Ty::Unit | Ty::Int | Ty::Str | Ty::Error => false,
         };
         visiting.remove(ty);
         memo.insert(ty.clone(), affine);
@@ -166,11 +161,13 @@ impl Checker<'_> {
         match ty {
             Ty::Nominal(item) => self.item_kind(*item) == Some(ResolvedItemKind::Resource),
             Ty::List(element) => self.ty_directly_claims(element),
+            Ty::Function { once: true, .. } => true,
             Ty::Unit
             | Ty::Int
             | Ty::Str
             | Ty::Parameter(_)
             | Ty::Specialization { .. }
+            | Ty::Function { .. }
             | Ty::Error => false,
         }
     }

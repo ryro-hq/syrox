@@ -1,0 +1,44 @@
+mod std::pkg {
+    value PackageId(str);
+    value CatalogInput(str);
+    value SourceUrl(str);
+    value SourceDigest(str);
+    value SourceLimit(int);
+
+    struct Dependency {
+        package: PackageId;
+    }
+
+    struct Package {
+        id: PackageId;
+        dependencies: [Dependency];
+    }
+
+    // Opt-in to publishing typed factories from one locked recipe input.
+    struct Catalog {
+        input: CatalogInput;
+    }
+
+    struct SourceRequest {
+        url: SourceUrl;
+        sha256: SourceDigest;
+        maximum_bytes: SourceLimit;
+    }
+
+    pub fn source_request(
+        url: SourceUrl,
+        digest: SourceDigest,
+        limit: SourceLimit,
+    ) -> SourceRequest {
+        SourceRequest {
+            url = url;
+            sha256 = digest;
+            maximum_bytes = limit;
+        }
+    }
+
+    struct Acquisition {
+        package: PackageId;
+        sources: [SourceRequest];
+    }
+}

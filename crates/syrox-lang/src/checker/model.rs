@@ -41,6 +41,11 @@ pub enum Ty {
         arguments: Vec<Ty>,
     },
     List(Box<Ty>),
+    Function {
+        parameters: Vec<Ty>,
+        result: Box<Ty>,
+        once: bool,
+    },
     Error,
 }
 
@@ -48,24 +53,24 @@ impl Ty {
     pub(super) fn compatible(&self, other: &Self) -> bool {
         self == other || matches!(self, Self::Error) || matches!(other, Self::Error)
     }
-
-    pub(super) fn scalar(&self) -> bool {
-        matches!(
-            self,
-            Self::Int
-                | Self::Str
-                | Self::Parameter(_)
-                | Self::Nominal(_)
-                | Self::Specialization { .. }
-        )
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Elaboration {
-    ContextualVariant { enumeration: ItemId, index: u32 },
+    VariantConstructor {
+        index: u32,
+    },
+    FunctionSpecialization {
+        substitutions: BTreeMap<LocalId, Ty>,
+    },
+    ContextualVariant {
+        enumeration: ItemId,
+        index: u32,
+    },
     ValueLiteral(ItemId),
-    Erasure { source: Ty },
+    Erasure {
+        source: Ty,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

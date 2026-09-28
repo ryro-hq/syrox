@@ -1,6 +1,6 @@
 use super::{
     BTreeMap, BTreeSet, Checker, Context, Diagnostic, FunctionInfo, Item, ItemId, ItemKind,
-    Literal, LocalId, MAX_DIAGNOSTICS, ModuleId, ParsedSource, Path, Primitive,
+    Literal, LocalId, MAX_DIAGNOSTICS, ModuleId, OutputKind, ParsedSource, Path, Primitive,
     PrimitiveDeclaration, PrimitiveInfo, PrimitiveType, RawTy, ReferenceKind, RefinementKind,
     ResolvedItemKind, ResolvedTarget, Span, StructInfo, span_key,
 };
@@ -102,7 +102,7 @@ impl<'a> Checker<'a> {
         let root = self
             .module_by_path
             .get(&source.domain())
-            .and_then(|modules| modules.get(&[][..]))
+            .and_then(|modules| modules.get(source.module()))
             .expect("resolver records each source domain root")
             .to_owned();
         let mut stack: Vec<(&Item, Vec<String>, ModuleId)> = source
@@ -110,7 +110,7 @@ impl<'a> Checker<'a> {
             .items
             .iter()
             .rev()
-            .map(|item| (item, Vec::new(), root))
+            .map(|item| (item, source.module().to_vec(), root))
             .collect();
         while let Some((item, path, module)) = stack.pop() {
             if !self.charge(item.span) {
@@ -144,7 +144,18 @@ impl<'a> Checker<'a> {
                 ItemKind::TypeAlias(declaration) => {
                     if let Some(id) = self.declaration_id(declaration.name.span) {
                         self.item_context.insert(id, context);
-                        self.aliases.insert(id, declaration);
+                        let parameters = declaration
+                            .type_parameters
+                            .iter()
+                            .filter_map(|parameter| self.local_id(parameter.name.span))
+                            .collect();
+                        self.aliases.insert(
+                            id,
+                            super::AliasInfo {
+                                declaration,
+                                parameters,
+                            },
+                        );
                     }
                 }
                 ItemKind::Struct(declaration) => {
@@ -189,10 +200,19 @@ impl<'a> Checker<'a> {
                         );
                     }
                 }
-                ItemKind::Module(_)
-                | ItemKind::Use(_)
-                | ItemKind::Inputs(_)
-                | ItemKind::Outputs(_) => {}
+                ItemKind::Outputs(outputs) => {
+                    for output in &outputs.entries {
+                        if !self.charge(output.span) {
+                            return;
+                        }
+                        if let OutputKind::Value { ty, .. } = &output.kind
+                            && let Some(id) = self.declaration_id(output.span)
+                        {
+                            self.output_values.insert(id, ty);
+                        }
+                    }
+                }
+                ItemKind::Module(_) | ItemKind::Use(_) | ItemKind::Inputs(_) => {}
             }
         }
     }
@@ -210,9 +230,19 @@ impl<'a> Checker<'a> {
     }
 
     pub(super) fn validate_declarations(&mut self) {
-        let aliases: Vec<_> = self.aliases.values().copied().collect();
+        let aliases: Vec<_> = self.aliases.values().cloned().collect();
         for alias in aliases {
-            self.resolve_type(&alias.ty, &BTreeMap::new(), 0);
+            let params = alias
+                .parameters
+                .iter()
+                .copied()
+                .map(|id| (id, RawTy::Parameter(id)))
+                .collect();
+            let ty = self.resolve_raw_type(&alias.declaration.ty, &params, 0);
+            if let Some(concrete) = self.concretize(ty, &BTreeMap::new(), alias.declaration.ty.span)
+            {
+                self.track_generic_instances(&concrete, alias.declaration.ty.span);
+            }
         }
         let structures: Vec<_> = self
             .structs
@@ -222,6 +252,7 @@ impl<'a> Checker<'a> {
         for (id, info) in structures {
             self.validate_struct(id, &info);
         }
+        self.validate_enums();
         let primitives: Vec<_> = self
             .primitives
             .iter()

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -104,10 +104,17 @@ impl Source {
 #[derive(Clone, Debug)]
 pub struct SourceSet {
     sources: Vec<Source>,
-    domains: Vec<SourceDomainId>,
-    input_domains: Option<Arc<BTreeMap<String, SourceDomainId>>>,
+    metadata: Box<SourceMetadata>,
+    input_domains: Option<Arc<BTreeMap<SourceDomainId, BTreeMap<String, SourceDomainId>>>>,
     total_bytes: usize,
     next_domain: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SourceMetadata {
+    domains: Vec<SourceDomainId>,
+    modules: Vec<Vec<String>>,
+    project_roots: BTreeSet<SourceDomainId>,
 }
 
 impl Default for SourceSet {
@@ -117,10 +124,10 @@ impl Default for SourceSet {
 }
 
 impl SourceSet {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             sources: Vec::new(),
-            domains: Vec::new(),
+            metadata: Box::default(),
             input_domains: None,
             total_bytes: 0,
             next_domain: 2,
@@ -144,16 +151,78 @@ impl SourceSet {
         &mut self,
         alias: impl Into<String>,
     ) -> Result<SourceDomainId, SourceError> {
+        self.create_domain(SourceDomainId::PROJECT, alias.into(), false)
+    }
+
+    /// Bind an authenticated child project's root as one input of its parent.
+    /// A child project owns its own input alias namespace.
+    pub fn create_project_domain(
+        &mut self,
+        parent: SourceDomainId,
+        alias: impl Into<String>,
+    ) -> Result<SourceDomainId, SourceError> {
+        self.create_domain(parent, alias.into(), true)
+    }
+
+    /// Bind another authenticated edge to an already admitted project snapshot.
+    pub fn bind_project_domain(
+        &mut self,
+        parent: SourceDomainId,
+        alias: impl Into<String>,
+        domain: SourceDomainId,
+    ) -> Result<(), SourceError> {
+        if (parent != SourceDomainId::PROJECT && !self.metadata.project_roots.contains(&parent))
+            || !self.metadata.project_roots.contains(&domain)
+        {
+            return Err(SourceError::InvalidProjectDomain);
+        }
         let alias = alias.into();
+        if alias == "std" {
+            return Err(SourceError::ReservedInputAlias);
+        }
+        let aliases = Arc::make_mut(
+            self.input_domains
+                .get_or_insert_with(|| Arc::new(BTreeMap::new())),
+        )
+        .entry(parent)
+        .or_default();
+        if aliases.contains_key(&alias) {
+            return Err(SourceError::DuplicateInputAlias);
+        }
+        aliases.insert(alias, domain);
+        Ok(())
+    }
+
+    pub fn create_child_input_domain(
+        &mut self,
+        parent: SourceDomainId,
+        alias: impl Into<String>,
+    ) -> Result<SourceDomainId, SourceError> {
+        self.create_domain(parent, alias.into(), false)
+    }
+
+    fn create_domain(
+        &mut self,
+        parent: SourceDomainId,
+        alias: String,
+        project: bool,
+    ) -> Result<SourceDomainId, SourceError> {
+        if parent != SourceDomainId::PROJECT && !self.metadata.project_roots.contains(&parent) {
+            return Err(SourceError::InvalidProjectDomain);
+        }
         if alias == "std" {
             return Err(SourceError::ReservedInputAlias);
         }
         if self
             .input_domains
             .as_ref()
+            .and_then(|domains| domains.get(&parent))
             .is_some_and(|domains| domains.contains_key(&alias))
         {
             return Err(SourceError::DuplicateInputAlias);
+        }
+        if self.next_domain as usize >= MAX_SOURCES + 2 {
+            return Err(SourceError::TooManyDomains);
         }
         let domain = SourceDomainId(self.next_domain);
         self.next_domain = self
@@ -164,8 +233,25 @@ impl SourceSet {
             self.input_domains
                 .get_or_insert_with(|| Arc::new(BTreeMap::new())),
         )
+        .entry(parent)
+        .or_default()
         .insert(alias, domain);
+        if project {
+            self.metadata.project_roots.insert(domain);
+        }
         Ok(domain)
+    }
+
+    pub fn add_to_project_domain(
+        &mut self,
+        domain: SourceDomainId,
+        name: impl Into<Arc<str>>,
+        text: impl Into<Arc<str>>,
+    ) -> Result<SourceId, SourceError> {
+        if !self.metadata.project_roots.contains(&domain) {
+            return Err(SourceError::InvalidProjectDomain);
+        }
+        self.add_to_input_domain(domain, name, text)
     }
 
     pub fn add_to_input_domain(
@@ -179,6 +265,34 @@ impl SourceSet {
         }
         let source = Source::new(name, text)?;
         self.insert_in_domain(domain, source)
+    }
+
+    /// Give one authenticated input file its own logical module. The loader,
+    /// not source text, assigns this path from the pinned input inventory.
+    pub fn add_to_input_module(
+        &mut self,
+        domain: SourceDomainId,
+        name: impl Into<Arc<str>>,
+        text: impl Into<Arc<str>>,
+        module: Vec<String>,
+    ) -> Result<SourceId, SourceError> {
+        if module.is_empty()
+            || module.len() > crate::MAX_DEPTH
+            || module.iter().any(|part| {
+                part.is_empty()
+                    || part.len() > 255
+                    || !part.bytes().enumerate().all(|(index, byte)| {
+                        byte == b'_'
+                            || byte.is_ascii_alphabetic()
+                            || (index > 0 && byte.is_ascii_digit())
+                    })
+            })
+        {
+            return Err(SourceError::InvalidInputModule);
+        }
+        let id = self.add_to_input_domain(domain, name, text)?;
+        self.metadata.modules[id.index()] = module;
+        Ok(id)
     }
 
     /// Adds a source which the caller asserts is authenticated standard-library text.
@@ -211,7 +325,8 @@ impl SourceSet {
         let id =
             SourceId(u32::try_from(self.sources.len()).map_err(|_| SourceError::TooManySources)?);
         self.sources.push(source);
-        self.domains.push(domain);
+        self.metadata.domains.push(domain);
+        self.metadata.modules.push(Vec::new());
         self.total_bytes = total_bytes;
         Ok(id)
     }
@@ -221,11 +336,33 @@ impl SourceSet {
     }
 
     pub fn domain(&self, id: SourceId) -> Option<SourceDomainId> {
-        self.domains.get(id.index()).copied()
+        self.metadata.domains.get(id.index()).copied()
     }
 
-    pub(crate) fn input_domains(&self) -> Option<&BTreeMap<String, SourceDomainId>> {
+    pub fn child_project_domain(
+        &self,
+        parent: SourceDomainId,
+        alias: &str,
+    ) -> Option<SourceDomainId> {
+        let domain = *self.input_domains.as_ref()?.get(&parent)?.get(alias)?;
+        self.metadata
+            .project_roots
+            .contains(&domain)
+            .then_some(domain)
+    }
+
+    pub(crate) fn module(&self, id: SourceId) -> Option<&[String]> {
+        self.metadata.modules.get(id.index()).map(Vec::as_slice)
+    }
+
+    pub(crate) fn input_domains(
+        &self,
+    ) -> Option<&BTreeMap<SourceDomainId, BTreeMap<String, SourceDomainId>>> {
         self.input_domains.as_deref()
+    }
+
+    pub(crate) fn project_roots(&self) -> &BTreeSet<SourceDomainId> {
+        &self.metadata.project_roots
     }
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (SourceId, &Source)> {
@@ -256,6 +393,10 @@ pub enum SourceError {
     TooManyDomains,
     #[error("input source domain was not created by this source set")]
     InvalidInputDomain,
+    #[error("parent is not an authenticated project domain")]
+    InvalidProjectDomain,
+    #[error("input module path must be a bounded sequence of identifiers")]
+    InvalidInputModule,
     #[error("input alias is already bound in this source set")]
     DuplicateInputAlias,
     #[error("`std` is reserved and cannot be used as an input alias")]
@@ -308,7 +449,11 @@ mod tests {
         let domain = sources.create_input_domain("catalog").unwrap();
 
         assert_eq!(
-            sources.input_domains().unwrap().get("catalog"),
+            sources
+                .input_domains()
+                .unwrap()
+                .get(&SourceDomainId::PROJECT)
+                .and_then(|aliases| aliases.get("catalog")),
             Some(&domain)
         );
         assert_eq!(
@@ -318,6 +463,42 @@ mod tests {
         assert_eq!(
             sources.create_input_domain("std").unwrap_err(),
             SourceError::ReservedInputAlias
+        );
+    }
+
+    #[test]
+    fn project_domains_own_isolated_bounded_alias_namespaces() {
+        let mut sources = SourceSet::new();
+        let first = sources
+            .create_project_domain(SourceDomainId::project(), "first")
+            .unwrap();
+        let second = sources
+            .create_project_domain(SourceDomainId::project(), "second")
+            .unwrap();
+        let first_dep = sources.create_child_input_domain(first, "dep").unwrap();
+        let second_dep = sources.create_child_input_domain(second, "dep").unwrap();
+        assert_ne!(first_dep, second_dep);
+        assert_eq!(
+            sources.create_child_input_domain(first_dep, "nested"),
+            Err(SourceError::InvalidProjectDomain)
+        );
+        assert_eq!(
+            sources.add_to_project_domain(first_dep, "invalid.srx", ""),
+            Err(SourceError::InvalidProjectDomain)
+        );
+        assert_eq!(
+            sources.create_project_domain(first, "std"),
+            Err(SourceError::ReservedInputAlias)
+        );
+        assert_eq!(
+            sources.create_project_domain(first, "dep"),
+            Err(SourceError::DuplicateInputAlias)
+        );
+        let nested = sources.create_project_domain(first, "nested").unwrap();
+        assert!(
+            sources
+                .add_to_project_domain(nested, "nested/main.srx", "")
+                .is_ok()
         );
     }
 }

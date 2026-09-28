@@ -51,8 +51,10 @@ impl Resolver<'_> {
             // Only sources explicitly assigned the authenticated standard
             // library origin participate in this reserved mapping.
             bases.push((SourceDomainId::STANDARD_LIBRARY, Vec::new()));
-        } else if self.modules[module.index()].domain == SourceDomainId::PROJECT
-            && let Some(&domain) = self.input_domains.get(&written[0])
+        } else if let Some(&domain) = self
+            .input_domains
+            .get(&self.modules[module.index()].domain)
+            .and_then(|aliases| aliases.get(&written[0]))
         {
             bases.push((domain, Vec::new()));
             consumed = 1;
@@ -169,6 +171,16 @@ impl Resolver<'_> {
             {
                 let boundary_path = &boundary_module.path.segments;
                 if candidate.len() != boundary_path.len() + 1 {
+                    if candidate.len() > boundary_path.len() + 1
+                        && candidate.get(boundary_path.len()).is_some_and(|name| {
+                            self.module_info[module.index()]
+                                .public_children
+                                .contains(name)
+                        })
+                    {
+                        boundary = self.parent(module);
+                        continue;
+                    }
                     return None;
                 }
                 item = self.module_info[module.index()]
@@ -203,6 +215,8 @@ impl Resolver<'_> {
                 ResolvedItemKind::Value
                     | ResolvedItemKind::Resource
                     | ResolvedItemKind::OutputValue
+                    | ResolvedItemKind::Function
+                    | ResolvedItemKind::OutputFunction
             ),
             Expected::Struct => matches!(actual, ResolvedItemKind::Struct),
         };
@@ -257,8 +271,10 @@ impl Resolver<'_> {
             .is_some_and(|segment| segment.text == "std")
         {
             bases.push((SourceDomainId::STANDARD_LIBRARY, Vec::new()));
-        } else if self.modules[module.index()].domain == SourceDomainId::PROJECT
-            && let Some(&domain) = self.input_domains.get(&enum_segments[0].text)
+        } else if let Some(&domain) = self
+            .input_domains
+            .get(&self.modules[module.index()].domain)
+            .and_then(|aliases| aliases.get(&enum_segments[0].text))
         {
             bases.push((domain, Vec::new()));
             consumed = 1;

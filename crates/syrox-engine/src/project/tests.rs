@@ -1,3 +1,4 @@
+use sha2::Digest as _;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
@@ -20,8 +21,6 @@ use super::*;
 use crate::linux_fd::OpenError;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-
-const PACKAGE_STANDARD_LIBRARY: &str = include_str!("../../../../std/pkg.srx");
 
 struct TempProject(PathBuf);
 
@@ -50,13 +49,8 @@ impl Drop for TempProject {
 }
 
 fn package_configuration() -> CheckConfiguration {
-    let source =
-        AuthenticatedStandardSource::from_authenticated("std/pkg.srx", PACKAGE_STANDARD_LIBRARY)
-            .unwrap();
     CheckConfiguration {
-        standard_library: Some(
-            AuthenticatedStandardLibrary::from_authenticated(vec![source]).unwrap(),
-        ),
+        standard_library: Some(AuthenticatedStandardLibrary::bundled()),
         ..CheckConfiguration::default()
     }
 }
@@ -70,18 +64,1521 @@ fn package_plan(source: &str) -> Result<crate::Plan, ProjectOperationError> {
 }
 
 #[test]
-fn development_output_is_an_explicit_validated_build_edge() {
-    let standard = AuthenticatedStandardSource::from_authenticated(
-        "std/pkg.srx",
-        include_str!("../../../../std/pkg.srx"),
+fn external_child_lock_binds_its_sources_and_parent_edge() {
+    let workspace = TempProject::new();
+    let child = workspace.0.join("child");
+    let consumer = workspace.0.join("consumer");
+    fs::create_dir(&child).unwrap();
+    fs::create_dir(&consumer).unwrap();
+    fs::write(
+        child.join("main.srx"),
+        "pub struct X {} pub fn make() -> X { X {} }",
     )
     .unwrap();
-    let config = CheckConfiguration {
-        standard_library: Some(
-            AuthenticatedStandardLibrary::from_authenticated(vec![standard]).unwrap(),
-        ),
-        ..CheckConfiguration::default()
+    fs::write(
+        consumer.join("main.srx"),
+        "inputs { pkgs = \"path:../child\"; } outputs { selected: pkgs::X = pkgs::make(); }",
+    )
+    .unwrap();
+    lock_project(&child).unwrap();
+    assert!(matches!(
+        lock_project(&consumer).unwrap().status(),
+        crate::LockStatus::Created
+    ));
+    check_project_lock(&consumer).unwrap();
+    fs::write(
+        child.join("main.srx"),
+        "pub struct X {} pub fn make() -> X { X {} } // drift",
+    )
+    .unwrap();
+    assert!(matches!(
+        check_project_lock(&consumer),
+        Err(ProjectOperationError::Check(
+            CheckFailure::InvalidChildLock { .. }
+        ))
+    ));
+    lock_project(&child).unwrap();
+    assert!(matches!(
+        check_project_lock(&consumer),
+        Err(ProjectOperationError::GraphDrift)
+    ));
+    lock_project(&consumer).unwrap();
+    check_project_lock(&consumer).unwrap();
+}
+
+#[test]
+fn external_child_rejects_symlink_and_cycle() {
+    let workspace = TempProject::new();
+    let child = workspace.0.join("child");
+    let consumer = workspace.0.join("consumer");
+    fs::create_dir(&child).unwrap();
+    fs::create_dir(&consumer).unwrap();
+    fs::write(child.join("main.srx"), "pub struct X {}").unwrap();
+    fs::write(
+        consumer.join("main.srx"),
+        "inputs { pkgs = \"path:../child\"; }",
+    )
+    .unwrap();
+    symlink(&child, workspace.0.join("linked")).unwrap();
+    fs::write(
+        consumer.join("main.srx"),
+        "inputs { pkgs = \"path:../linked\"; }",
+    )
+    .unwrap();
+    assert!(matches!(
+        check_project(&consumer),
+        Err(CheckFailure::SymbolicLink { .. })
+    ));
+    fs::write(
+        consumer.join("main.srx"),
+        "inputs { pkgs = \"path:../consumer\"; }",
+    )
+    .unwrap();
+    assert!(matches!(
+        check_project(&consumer),
+        Err(CheckFailure::ChildProjectCycle { .. })
+    ));
+}
+
+#[test]
+fn external_origin_requires_canonical_relative_spelling() {
+    for locator in [
+        "path:../child/./nested",
+        "path:../child//nested",
+        "path:../child/",
+        "path:../child/../nested",
+    ] {
+        let project = TempProject::new();
+        project.write("main.srx", &format!("inputs {{ dep = \"{locator}\"; }}"));
+        assert!(
+            matches!(
+                check_project(&project.0),
+                Err(CheckFailure::UnsafeInputPath { .. })
+            ),
+            "{locator}"
+        );
+    }
+}
+
+#[test]
+fn external_child_modules_are_imported_from_its_own_root() {
+    let workspace = TempProject::new();
+    let child = workspace.0.join("child");
+    let consumer = workspace.0.join("consumer");
+    fs::create_dir_all(child.join("recipes")).unwrap();
+    fs::create_dir(&consumer).unwrap();
+    fs::write(child.join("main.srx"), "inputs { recipes = \"modules:recipes\"; } pub type X = recipes::hello::X; pub fn make() -> X { recipes::hello::make() }").unwrap();
+    fs::write(
+        child.join("recipes/hello.srx"),
+        "pub struct X {} pub fn make() -> X { X {} }",
+    )
+    .unwrap();
+    fs::write(
+        consumer.join("main.srx"),
+        "inputs { pkgs = \"path:../child\"; } outputs { selected: pkgs::X = pkgs::make(); }",
+    )
+    .unwrap();
+    lock_project(&child).unwrap();
+    lock_project(&consumer).unwrap();
+    assert!(
+        fs::read(consumer.join(crate::LOCK_FILE_NAME))
+            .unwrap()
+            .starts_with(b"syrox-lock-v2\n")
+    );
+    assert!(!consumer.join("Syrox.graph.lock").exists());
+    check_project_lock(&consumer).unwrap();
+    fs::write(
+        child.join("recipes/hello.srx"),
+        "pub struct X {} pub fn make() -> X { X {} } // changed",
+    )
+    .unwrap();
+    assert!(matches!(
+        check_project_lock(&consumer),
+        Err(ProjectOperationError::Check(
+            CheckFailure::InvalidChildLock { .. }
+        ))
+    ));
+}
+
+#[test]
+fn child_assets_are_pinned_and_new_files_require_relock() {
+    let workspace = TempProject::new();
+    let child = workspace.0.join("child");
+    let consumer = workspace.0.join("consumer");
+    fs::create_dir_all(child.join("assets/patches")).unwrap();
+    fs::create_dir(&consumer).unwrap();
+    fs::write(child.join("main.srx"), "pub struct X {}").unwrap();
+    fs::write(child.join("assets/patches/fix.patch"), b"first\0patch").unwrap();
+    fs::write(
+        consumer.join("main.srx"),
+        "inputs { child = \"path:../child\"; } outputs { selected: child::X = child::X {}; }",
+    )
+    .unwrap();
+    lock_project(&child).unwrap();
+    assert!(
+        fs::read(child.join(crate::LOCK_FILE_NAME))
+            .unwrap()
+            .starts_with(b"syrox-lock-v3\n")
+    );
+    lock_project(&consumer).unwrap();
+    check_project_lock(&consumer).unwrap();
+    fs::write(child.join("assets/patches/fix.patch"), b"second patch").unwrap();
+    assert!(matches!(
+        check_project_lock(&consumer),
+        Err(ProjectOperationError::Check(
+            CheckFailure::InvalidChildLock { .. }
+        ))
+    ));
+    lock_project(&child).unwrap();
+    assert!(matches!(
+        check_project_lock(&consumer),
+        Err(ProjectOperationError::GraphDrift)
+    ));
+    lock_project(&consumer).unwrap();
+    fs::write(child.join("assets/patches/another.patch"), b"added").unwrap();
+    assert!(matches!(
+        check_project_lock(&consumer),
+        Err(ProjectOperationError::Check(
+            CheckFailure::InvalidChildLock { .. }
+        ))
+    ));
+}
+
+#[test]
+fn plan_does_not_resolve_imported_asset_from_a_homonymous_consumer_path() {
+    let workspace = TempProject::new();
+    let child = workspace.0.join("child");
+    let consumer = workspace.0.join("consumer");
+    fs::create_dir_all(child.join("assets")).unwrap();
+    fs::create_dir_all(consumer.join("assets")).unwrap();
+    fs::write(child.join("main.srx"), "pub struct X {}").unwrap();
+    fs::write(child.join("assets/source.tar.gz"), b"child").unwrap();
+    fs::write(consumer.join("assets/source.tar.gz"), b"consumer").unwrap();
+    let child_digest = sha2::Sha256::digest(b"child");
+    let digest = child_digest.iter().fold(String::new(), |mut result, byte| {
+        write!(result, "{byte:02x}").unwrap();
+        result
+    });
+    fs::write(consumer.join("main.srx"), format!(r#"inputs {{ child = "path:../child"; }} outputs {{
+        package: std::Package = std::Package {{ id = "app"; dependencies = []; }};
+        request: std::Acquisition = std::Acquisition {{ package = "app"; sources = [
+            std::SourceRequest {{ url = "project:assets/source.tar.gz"; sha256 = "{digest}"; maximum_bytes = 100; }}
+        ]; }};
+    }}"#)).unwrap();
+    let configuration = package_configuration();
+    lock_project_with(&child, &configuration).unwrap();
+    lock_project_with(&consumer, &configuration).unwrap();
+    assert!(matches!(
+        plan_project_with(&consumer, &configuration),
+        Err(ProjectOperationError::UnpinnedProjectAsset { .. })
+    ));
+}
+
+#[test]
+fn imported_source_request_uses_its_own_locked_project_asset() {
+    let workspace = TempProject::new();
+    let child = workspace.0.join("child");
+    let consumer = workspace.0.join("consumer");
+    fs::create_dir_all(child.join("assets")).unwrap();
+    fs::create_dir_all(consumer.join("assets")).unwrap();
+    let digest = "ddc9e669194254cef019a29d3619a2c16592e5d52e1a81e98b01bd52319149a3";
+    fs::write(child.join("assets/source.tar.gz"), b"child").unwrap();
+    fs::write(consumer.join("assets/source.tar.gz"), b"consumer").unwrap();
+    fs::write(child.join("main.srx"), format!(r#"
+        pub fn source() -> std::Acquisition {{
+            std::Acquisition {{ package = "app"; sources = [
+                std::SourceRequest {{ url = "project:assets/source.tar.gz"; sha256 = "{digest}"; maximum_bytes = 100; }}
+            ]; }}
+        }}
+    "#)).unwrap();
+    fs::write(
+        consumer.join("main.srx"),
+        r#"
+        inputs { child = "path:../child"; }
+        outputs {
+            package: std::Package = std::Package { id = "app"; dependencies = []; };
+            request: std::Acquisition = child::source();
+        }
+    "#,
+    )
+    .unwrap();
+    let configuration = package_configuration();
+    lock_project_with(&child, &configuration).unwrap();
+    lock_project_with(&consumer, &configuration).unwrap();
+    let plan = plan_project_with(&consumer, &configuration).unwrap();
+    let request = plan
+        .acquisitions()
+        .next()
+        .unwrap()
+        .sources()
+        .next()
+        .unwrap();
+    assert_eq!(
+        fs::canonicalize(plan.project_root(request.owner().unwrap()).unwrap()).unwrap(),
+        fs::canonicalize(&child).unwrap()
+    );
+    let origin = plan.project_root(request.owner().unwrap()).unwrap();
+    let root = crate::RootName::new(format!("source_{}", request.digest())).unwrap();
+    let store = crate::Store::initialize(&workspace.0.join("store")).unwrap();
+    let acquire = |store: &crate::Store| {
+        crate::realize::acquire_build_local(
+            store,
+            origin,
+            "assets/source.tar.gz",
+            request.digest(),
+            request.maximum_bytes(),
+            &root,
+            &crate::BuildCancellation::default(),
+        )
     };
+    acquire(&store).unwrap(); // miss must read the child's bytes, not the homonymous consumer file
+    fs::remove_file(child.join("assets/source.tar.gz")).unwrap();
+    acquire(&store).unwrap(); // hit must use the pinned cached bytes
+    symlink(
+        consumer.join("assets/source.tar.gz"),
+        child.join("assets/source.tar.gz"),
+    )
+    .unwrap();
+    let empty_store = crate::Store::initialize(&workspace.0.join("uncached-store")).unwrap();
+    assert!(acquire(&empty_store).is_err()); // no symlink traversal on a miss
+    fs::remove_file(child.join("assets/source.tar.gz")).unwrap();
+    fs::write(child.join("assets/source.tar.gz"), b"child").unwrap();
+    let moved_child = workspace.0.join("moved-child");
+    fs::rename(&child, &moved_child).unwrap();
+    symlink(&moved_child, &child).unwrap();
+    assert!(acquire(&empty_store).is_err()); // root substitution is rejected too
+    fs::remove_file(&child).unwrap();
+    fs::rename(&moved_child, &child).unwrap();
+    fs::write(child.join("assets/source.tar.gz"), b"changed").unwrap();
+    assert!(plan_project_with(&consumer, &configuration).is_err());
+    fs::write(consumer.join("assets/source.tar.gz"), b"child").unwrap();
+    lock_project_with(&child, &configuration).unwrap();
+    lock_project_with(&consumer, &configuration).unwrap();
+    assert!(matches!(
+        plan_project_with(&consumer, &configuration),
+        Err(ProjectOperationError::UnpinnedProjectAsset { .. })
+    ));
+}
+
+#[test]
+fn transitive_import_preserves_the_leaf_source_origin() {
+    let workspace = TempProject::new();
+    let leaf = workspace.0.join("leaf");
+    let middle = workspace.0.join("middle");
+    let consumer = workspace.0.join("consumer");
+    for project in [&leaf, &middle, &consumer] {
+        fs::create_dir_all(project.join("assets")).unwrap();
+    }
+    fs::write(leaf.join("assets/source"), b"child").unwrap();
+    fs::write(middle.join("assets/source"), b"middle").unwrap();
+    fs::write(consumer.join("assets/source"), b"consumer").unwrap();
+    fs::write(
+        leaf.join("main.srx"),
+        r#"
+        pub fn source() -> std::Acquisition {
+            std::Acquisition { package = "app"; sources = [std::SourceRequest {
+                url = "project:assets/source";
+                sha256 = "ddc9e669194254cef019a29d3619a2c16592e5d52e1a81e98b01bd52319149a3";
+                maximum_bytes = 100;
+            }]; }
+        }
+    "#,
+    )
+    .unwrap();
+    fs::write(
+        middle.join("main.srx"),
+        r#"
+        inputs { leaf = "path:../leaf"; }
+        pub fn source() -> std::Acquisition { leaf::source() }
+    "#,
+    )
+    .unwrap();
+    fs::write(
+        consumer.join("main.srx"),
+        r#"
+        inputs { middle = "path:../middle"; }
+        outputs {
+            package: std::Package = std::Package { id = "app"; dependencies = []; };
+            source: std::Acquisition = middle::source();
+        }
+    "#,
+    )
+    .unwrap();
+    let configuration = package_configuration();
+    for project in [&leaf, &middle, &consumer] {
+        lock_project_with(project, &configuration).unwrap();
+    }
+    let plan = plan_project_with(&consumer, &configuration).unwrap();
+    let source = plan
+        .acquisitions()
+        .next()
+        .unwrap()
+        .sources()
+        .next()
+        .unwrap();
+    assert_eq!(
+        fs::canonicalize(plan.project_root(source.owner().unwrap()).unwrap()).unwrap(),
+        fs::canonicalize(leaf).unwrap()
+    );
+}
+
+#[test]
+fn diamond_imports_share_snapshot_identity_and_source_budget() {
+    let workspace = TempProject::new();
+    for directory in ["leaf", "left", "right", "consumer"] {
+        fs::create_dir(workspace.0.join(directory)).unwrap();
+    }
+    let leaf = "pub struct Item {} outputs { item: Item = Item {}; }";
+    let left = r#"inputs { leaf = "path:../leaf"; } pub type Item = leaf::Item; pub fn make() -> Item { leaf::item }"#;
+    let right = r#"inputs { leaf = "path:../leaf"; } pub type Item = leaf::Item; pub fn accept(item: Item) -> Item { item }"#;
+    let consumer = r#"inputs { left = "path:../left"; right = "path:../right"; } outputs { shared: right::Item = right::accept(left::make()); }"#;
+    for (name, text) in [
+        ("leaf", leaf),
+        ("left", left),
+        ("right", right),
+        ("consumer", consumer),
+    ] {
+        fs::write(workspace.0.join(name).join("main.srx"), text).unwrap();
+        lock_project(&workspace.0.join(name)).unwrap();
+    }
+    let mut configuration = CheckConfiguration::default();
+    configuration.project_limits.max_total_bytes =
+        leaf.len() + left.len() + right.len() + consumer.len();
+    let root = workspace.0.join("consumer");
+    let loaded = loader::load_project_linux(&root, &configuration).unwrap();
+    let a = &loaded.children[0].1.children[0].1;
+    let b = &loaded.children[1].1.children[0].1;
+    assert!(std::sync::Arc::ptr_eq(a, b));
+    assert_eq!(loaded.sources().len(), 4);
+    assert!(plan_project_with(&root, &configuration).is_ok());
+    configuration.project_limits.max_total_bytes -= 1;
+    assert!(matches!(
+        check_project_with(&root, &configuration),
+        Err(CheckFailure::ProjectTooLarge { .. })
+    ));
+    fs::write(workspace.0.join("leaf/main.srx"), "pub struct Changed {}").unwrap();
+    assert!(check_project_lock(&root).is_err());
+}
+
+#[test]
+fn cached_snapshot_cannot_bypass_graph_depth_limit() {
+    let workspace = TempProject::new();
+    for (name, text) in [
+        ("bottom", "pub struct Item {}"),
+        ("shared", "inputs { bottom = \"path:../bottom\"; }"),
+        ("middle", "inputs { shared = \"path:../shared\"; }"),
+        ("deep", "inputs { middle = \"path:../middle\"; }"),
+        (
+            "root",
+            "inputs { a = \"path:../shared\"; z = \"path:../deep\"; }",
+        ),
+    ] {
+        fs::create_dir(workspace.0.join(name)).unwrap();
+        fs::write(workspace.0.join(name).join("main.srx"), text).unwrap();
+        lock_project(&workspace.0.join(name)).unwrap();
+    }
+    let mut configuration = CheckConfiguration::default();
+    configuration.project_limits.max_directory_depth = 4;
+    assert!(matches!(
+        check_project_with(&workspace.0.join("root"), &configuration),
+        Err(CheckFailure::ProjectGraphDepth { limit: 4 })
+    ));
+}
+
+#[test]
+fn standard_source_helper_preserves_the_child_asset_origin_in_the_plan() {
+    let workspace = TempProject::new();
+    let child = workspace.0.join("child");
+    let consumer = workspace.0.join("consumer");
+    fs::create_dir_all(child.join("assets")).unwrap();
+    fs::create_dir_all(&consumer).unwrap();
+    fs::write(child.join("assets/source"), b"child").unwrap();
+    fs::write(
+        child.join("main.srx"),
+        r#"
+        pub fn source() -> std::Acquisition {
+            std::Acquisition { package = "app"; sources = [std::source_request(
+                "project:assets/source",
+                "ddc9e669194254cef019a29d3619a2c16592e5d52e1a81e98b01bd52319149a3",
+                100,
+            )]; }
+        }
+    "#,
+    )
+    .unwrap();
+    fs::write(
+        consumer.join("main.srx"),
+        r#"
+        inputs { child = "path:../child"; }
+        outputs {
+            package: std::Package = std::Package { id = "app"; dependencies = []; };
+            source: std::Acquisition = child::source();
+        }
+    "#,
+    )
+    .unwrap();
+    let configuration = package_configuration();
+    lock_project_with(&child, &configuration).unwrap();
+    lock_project_with(&consumer, &configuration).unwrap();
+    let plan = plan_project_with(&consumer, &configuration).unwrap();
+    let source = plan
+        .acquisitions()
+        .next()
+        .unwrap()
+        .sources()
+        .next()
+        .unwrap();
+    assert_eq!(
+        fs::canonicalize(plan.project_root(source.owner().unwrap()).unwrap()).unwrap(),
+        fs::canonicalize(child).unwrap()
+    );
+}
+
+#[test]
+fn standard_list_helpers_compose_project_defined_types() {
+    let project = TempProject::new();
+    project.write(
+        "main.srx",
+        r"
+        value Number(int);
+        struct Wrapped<T> { item: T; }
+        fn wrap<T>(item: T) -> Wrapped<T> { Wrapped<T> { item = item; } }
+        outputs {
+            transformed: [Wrapped<Number>] = std::map<Number, Wrapped<Number>>(
+                std::flatten<Number>([[Number(1)], [Number(2)]]), wrap<Number>
+            );
+        }
+    ",
+    );
+    let configuration = package_configuration();
+    lock_project_with(&project.0, &configuration).unwrap();
+    let plan = plan_project_with(&project.0, &configuration).unwrap();
+    assert!(plan.to_string().contains("transformed"));
+}
+
+#[test]
+fn imported_filter_map_keeps_affine_payloads_and_plan_enum_arguments() {
+    let workspace = TempProject::new();
+    let child = workspace.0.join("child");
+    let consumer = workspace.0.join("consumer");
+    fs::create_dir(&child).unwrap();
+    fs::create_dir(&consumer).unwrap();
+    fs::write(
+        child.join("main.srx"),
+        r"
+        pub resource Ticket(int);
+        pub enum Entry { Keep(Ticket), Drop }
+        pub fn keep(entry: Entry) -> std::Option<Entry> {
+            match entry {
+                Keep(ticket) => std::Option::Some(Entry::Keep(ticket)),
+                Drop => std::Option::None(),
+            }
+        }
+        pub fn select(entry: Entry) -> std::Option<Ticket> {
+            match entry {
+                Keep(ticket) => std::Option::Some(ticket),
+                Drop => std::Option::None(),
+            }
+        }
+    ",
+    )
+    .unwrap();
+    fs::write(consumer.join("main.srx"), r#"
+        inputs { child = "path:../child"; }
+        value Label(str);
+        outputs {
+            selected: [child::Ticket] = std::filter_map(
+                std::filter(
+                    [child::Entry::Keep(child::Ticket(1)), child::Entry::Drop, child::Entry::Keep(child::Ticket(2))],
+                    child::keep
+                ),
+                child::select
+            );
+            status: std::Result<Label, Label> = std::Result::Ok(Label("done"));
+        }
+    "#).unwrap();
+    let configuration = package_configuration();
+    lock_project_with(&child, &configuration).unwrap();
+    lock_project_with(&consumer, &configuration).unwrap();
+    let plan = plan_project_with(&consumer, &configuration).unwrap();
+    let selected = plan.roots().find(|root| root.name() == "selected").unwrap();
+    assert_eq!(selected.claims().count(), 2);
+    let crate::PlanValue::List { items, .. } = selected.value() else {
+        panic!("expected selected list");
+    };
+    assert_eq!(items.len(), 2);
+    let status = plan.roots().find(|root| root.name() == "status").unwrap();
+    assert!(
+        matches!(status.value(), crate::PlanValue::Variant { index: 0, payload, .. } if payload.len() == 1)
+    );
+    assert!(plan.to_string().contains("done"));
+}
+
+#[test]
+fn ordered_maps_sort_independently_of_insertion_and_reject_duplicate_keys() {
+    let project = TempProject::new();
+    project.write("main.srx", r#"
+        value I(int);
+        outputs {
+            forward: std::Result<std::OrderedMap<I>, std::MapKey> = std::map_from_entries([
+                std::MapEntry::Entry("a", I(1)), std::MapEntry::Entry("z", I(2)), std::MapEntry::Entry("é", I(3))
+            ]);
+            reverse: std::Result<std::OrderedMap<I>, std::MapKey> = std::map_from_entries([
+                std::MapEntry::Entry("é", I(3)), std::MapEntry::Entry("z", I(2)), std::MapEntry::Entry("a", I(1))
+            ]);
+            duplicate: std::Result<std::OrderedMap<I>, std::MapKey> = std::map_from_entries([
+                std::MapEntry::Entry("a", I(1)), std::MapEntry::Entry("a", I(2))
+            ]);
+            empty: std::Option<I> = std::map_get(std::map_empty<I>(), "missing");
+        }
+    "#);
+    let configuration = package_configuration();
+    lock_project_with(&project.0, &configuration).unwrap();
+    let plan = plan_project_with(&project.0, &configuration).unwrap();
+    let root = |name| {
+        plan.roots()
+            .find(|root| root.name() == name)
+            .unwrap()
+            .value()
+    };
+    assert_eq!(root("forward"), root("reverse"));
+    assert!(matches!(
+        root("forward"),
+        crate::PlanValue::Variant { index: 0, .. }
+    ));
+    assert!(
+        matches!(root("duplicate"), crate::PlanValue::Variant { index: 1, payload, .. } if matches!(payload.as_slice(), [crate::PlanValue::Nominal { value, .. }] if **value == crate::PlanValue::Str("a".into())))
+    );
+    assert!(
+        matches!(root("empty"), crate::PlanValue::Variant { index: 0, payload, .. } if payload.is_empty())
+    );
+}
+
+#[test]
+fn ordered_map_factories_are_importable_and_unselected_factories_stay_dormant() {
+    let workspace = TempProject::new();
+    let child = workspace.0.join("child");
+    let consumer = workspace.0.join("consumer");
+    fs::create_dir(&child).unwrap();
+    fs::create_dir(&consumer).unwrap();
+    fs::write(
+        child.join("main.srx"),
+        r#"
+        pub resource Ticket(int) where 1..=2;
+        fn good() -> Ticket { Ticket(1) }
+        fn disconnected() -> Ticket { Ticket(9) }
+        fn make() -> std::OrderedMap<fn() -> Ticket> {
+            match std::map_from_entries([
+                std::MapEntry::Entry("z-unused", disconnected),
+                std::MapEntry::Entry("a-selected", good)
+            ]) {
+                Ok(items) => items,
+                Err(_) => std::map_empty(),
+            }
+        }
+        outputs { factories: std::OrderedMap<fn() -> Ticket> = make(); }
+    "#,
+    )
+    .unwrap();
+    fs::write(
+        consumer.join("main.srx"),
+        r#"
+        inputs { child = "path:../child"; }
+        outputs {
+            names: [std::MapKey] = std::map_keys(child::factories);
+            selected: child::Ticket = match std::map_get(child::factories, "a-selected") {
+                Some(factory) => factory(),
+                None => child::Ticket(2),
+            };
+        }
+    "#,
+    )
+    .unwrap();
+    let configuration = package_configuration();
+    lock_project_with(&child, &configuration).unwrap();
+    lock_project_with(&consumer, &configuration).unwrap();
+    let plan = plan_project_with(&consumer, &configuration).unwrap();
+    let names = plan.roots().find(|root| root.name() == "names").unwrap();
+    assert_eq!(names.claims().count(), 0);
+    let crate::PlanValue::List { items, .. } = names.value() else {
+        panic!("expected names");
+    };
+    let keys: Vec<_> = items
+        .iter()
+        .map(|item| match item {
+            crate::PlanValue::Nominal { value, .. } => value.as_ref(),
+            _ => panic!("expected key"),
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            &crate::PlanValue::Str("a-selected".into()),
+            &crate::PlanValue::Str("z-unused".into())
+        ]
+    );
+    let selected = plan.roots().find(|root| root.name() == "selected").unwrap();
+    assert_eq!(selected.claims().count(), 1);
+    assert!(
+        matches!(selected.value(), crate::PlanValue::Nominal { value, .. } if **value == crate::PlanValue::Int(1))
+    );
+}
+
+#[test]
+fn ordered_map_affine_values_move_in_key_order() {
+    let project = TempProject::new();
+    project.write(
+        "main.srx",
+        r#"
+        resource Ticket(int);
+        outputs {
+            tickets: [Ticket] = match std::map_from_entries([
+                std::MapEntry::Entry("z", Ticket(2)), std::MapEntry::Entry("a", Ticket(1))
+            ]) {
+                Ok(items) => std::map_values(items),
+                Err(_) => [],
+            };
+        }
+    "#,
+    );
+    let configuration = package_configuration();
+    lock_project_with(&project.0, &configuration).unwrap();
+    let plan = plan_project_with(&project.0, &configuration).unwrap();
+    let root = plan.roots().next().unwrap();
+    assert_eq!(root.claims().count(), 2);
+    let crate::PlanValue::List { items, .. } = root.value() else {
+        panic!("expected tickets");
+    };
+    assert_eq!(items.len(), 2);
+    for (item, expected) in items.iter().zip(1..=2) {
+        assert!(
+            matches!(item, crate::PlanValue::Nominal { value, .. } if **value == crate::PlanValue::Int(expected))
+        );
+    }
+}
+
+#[test]
+fn ordered_map_constructor_and_affine_access_cannot_bypass_invariants() {
+    for (source, expected) in [
+        (
+            "value I(int); outputs { forged: std::OrderedMap<I> = std::OrderedMap<I> { entries = []; }; }",
+            "opaque struct constructor is private",
+        ),
+        (
+            "resource R(int); fn bad(items: std::OrderedMap<R>) -> [std::Option<R>] { [std::map_get(items, \"a\"), std::map_get(items, \"b\")] }",
+            "use of moved affine value",
+        ),
+        (
+            "resource R(int); fn bad(items: std::OrderedMap<once fn() -> R>) -> [std::OrderedMap<once fn() -> R>] { [items, items] }",
+            "use of moved affine value",
+        ),
+    ] {
+        let project = TempProject::new();
+        project.write("main.srx", source);
+        let result = check_project_with(&project.0, &package_configuration());
+        assert!(
+            matches!(&result, Err(CheckFailure::Diagnostics { errors, .. }) if errors.iter().any(|error| error.message.contains(expected))),
+            "{result:?}"
+        );
+    }
+}
+
+#[test]
+fn ordered_map_merge_preserves_values_and_reports_collisions() {
+    let project = TempProject::new();
+    project.write("main.srx", r#"
+        resource Ticket(int);
+        fn one(key: std::MapKey, item: Ticket) -> std::OrderedMap<Ticket> {
+            match std::map_insert(std::map_empty<Ticket>(), key, item) {
+                Ok(items) => items, Err(_) => std::map_empty(),
+            }
+        }
+        outputs {
+            joined: [Ticket] = match std::map_merge(one("z", Ticket(2)), one("a", Ticket(1))) {
+                Ok(items) => std::map_values(items), Err(_) => [],
+            };
+            duplicate: std::Result<std::OrderedMap<Ticket>, std::MapKey> = std::map_merge(one("a", Ticket(1)), one("a", Ticket(2)));
+        }
+    "#);
+    let configuration = package_configuration();
+    lock_project_with(&project.0, &configuration).unwrap();
+    let plan = plan_project_with(&project.0, &configuration).unwrap();
+    let joined = plan.roots().find(|root| root.name() == "joined").unwrap();
+    assert_eq!(joined.claims().count(), 2);
+    let crate::PlanValue::List { items, .. } = joined.value() else {
+        panic!("expected tickets");
+    };
+    assert_eq!(items.len(), 2);
+    for (item, expected) in items.iter().zip(1..=2) {
+        assert!(
+            matches!(item, crate::PlanValue::Nominal { value, .. } if **value == crate::PlanValue::Int(expected))
+        );
+    }
+    let duplicate = plan
+        .roots()
+        .find(|root| root.name() == "duplicate")
+        .unwrap();
+    assert!(matches!(
+        duplicate.value(),
+        crate::PlanValue::Variant { index: 1, .. }
+    ));
+}
+
+#[test]
+fn ordered_map_composition_respects_evaluation_work_and_expansion_limits() {
+    let project = TempProject::new();
+    let entries = (0..16)
+        .rev()
+        .map(|index| format!("std::MapEntry::Entry(\"key-{index:02}\", I({index}))"))
+        .collect::<Vec<_>>()
+        .join(",");
+    project.write("main.srx", &format!("value I(int); outputs {{ items: std::Result<std::OrderedMap<I>, std::MapKey> = std::map_from_entries([{entries}]); }}"));
+    assert!(check_project_with(&project.0, &package_configuration()).is_ok());
+    for work_limit in [true, false] {
+        let mut configuration = package_configuration();
+        if work_limit {
+            configuration.evaluation_limits.max_steps_per_root = 100;
+        } else {
+            configuration.evaluation_limits.max_expansion_bytes = 4096;
+        }
+        let expected = if work_limit {
+            "step limit"
+        } else {
+            "expansion byte limit"
+        };
+        let result = check_project_with(&project.0, &configuration);
+        assert!(
+            matches!(&result, Err(CheckFailure::Evaluation { errors, .. }) if errors.iter().any(|error| error.message.contains(expected))),
+            "{result:?}"
+        );
+    }
+}
+
+#[test]
+fn asset_tree_refuses_symlinks_before_publishing_a_lock() {
+    let project = TempProject::new();
+    project.write("main.srx", "pub struct X {}");
+    fs::create_dir(project.0.join("assets")).unwrap();
+    symlink(
+        project.0.join("main.srx"),
+        project.0.join("assets/patch.diff"),
+    )
+    .unwrap();
+    assert!(matches!(
+        lock_project(&project.0),
+        Err(ProjectOperationError::Check(
+            CheckFailure::SymbolicLink { .. }
+        ))
+    ));
+    assert!(!project.0.join(crate::LOCK_FILE_NAME).exists());
+}
+
+#[test]
+fn local_markdown_in_assets_does_not_change_the_published_snapshot() {
+    let project = TempProject::new();
+    project.write("main.srx", "pub struct X {}");
+    project.write("assets/fix.patch", "patch");
+    project.write("assets/README.md", "local notes");
+    lock_project(&project.0).unwrap();
+    let snapshot = fs::read(project.0.join(crate::LOCK_FILE_NAME)).unwrap();
+    fs::remove_file(project.0.join("assets/README.md")).unwrap();
+    check_project_lock(&project.0).unwrap();
+    assert_eq!(
+        fs::read(project.0.join(crate::LOCK_FILE_NAME)).unwrap(),
+        snapshot
+    );
+}
+
+#[test]
+fn transitive_child_lock_and_exports_are_verified_at_each_edge() {
+    let workspace = TempProject::new();
+    let leaf = workspace.0.join("leaf");
+    let middle = workspace.0.join("middle");
+    let consumer = workspace.0.join("consumer");
+    for path in [&leaf, &middle, &consumer] {
+        fs::create_dir(path).unwrap();
+    }
+    fs::write(
+        leaf.join("main.srx"),
+        "pub struct X {} pub fn make() -> X { X {} }",
+    )
+    .unwrap();
+    fs::write(middle.join("main.srx"), "inputs { leaf = \"path:../leaf\"; } pub type X = leaf::X; pub fn make() -> X { leaf::make() }").unwrap();
+    fs::write(
+        consumer.join("main.srx"),
+        "inputs { middle = \"path:../middle\"; } outputs { selected: middle::X = middle::make(); }",
+    )
+    .unwrap();
+    lock_project(&leaf).unwrap();
+    lock_project(&middle).unwrap();
+    lock_project(&consumer).unwrap();
+    check_project_lock(&consumer).unwrap();
+    fs::write(
+        leaf.join("main.srx"),
+        "pub struct X {} pub fn make() -> X { X {} } // drift",
+    )
+    .unwrap();
+    assert!(matches!(
+        check_project_lock(&consumer),
+        Err(ProjectOperationError::Check(
+            CheckFailure::InvalidChildLock { .. }
+        ))
+    ));
+    lock_project(&leaf).unwrap();
+    assert!(matches!(
+        check_project_lock(&consumer),
+        Err(ProjectOperationError::Check(
+            CheckFailure::InvalidChildLock { .. }
+        ))
+    ));
+    lock_project(&middle).unwrap();
+    assert!(matches!(
+        check_project_lock(&consumer),
+        Err(ProjectOperationError::GraphDrift)
+    ));
+}
+
+#[test]
+fn transitive_cycle_and_graph_depth_fail_before_any_lock_publication() {
+    let workspace = TempProject::new();
+    let left = workspace.0.join("left");
+    let right = workspace.0.join("right");
+    fs::create_dir(&left).unwrap();
+    fs::create_dir(&right).unwrap();
+    fs::write(
+        left.join("main.srx"),
+        "inputs { right = \"path:../right\"; }",
+    )
+    .unwrap();
+    fs::write(
+        right.join("main.srx"),
+        "inputs { left = \"path:../left\"; }",
+    )
+    .unwrap();
+    assert!(matches!(
+        lock_project(&left),
+        Err(ProjectOperationError::Check(
+            CheckFailure::ChildProjectCycle { .. }
+        ))
+    ));
+    assert!(!left.join(crate::LOCK_FILE_NAME).exists());
+    fs::write(right.join("main.srx"), "pub struct X {}").unwrap();
+    lock_project(&right).unwrap();
+    let mut configuration = CheckConfiguration::default();
+    configuration.project_limits.max_directory_depth = 1;
+    assert!(matches!(
+        check_project_with(&left, &configuration),
+        Err(CheckFailure::ProjectGraphDepth { .. })
+    ));
+}
+
+#[test]
+fn transitive_project_domain_keeps_local_aliases_scoped() {
+    let workspace = TempProject::new();
+    let leaf = workspace.0.join("leaf");
+    let middle = workspace.0.join("middle");
+    let consumer = workspace.0.join("consumer");
+    fs::create_dir_all(leaf.join("recipes")).unwrap();
+    fs::create_dir_all(middle.join("recipes")).unwrap();
+    fs::create_dir_all(consumer.join("recipes")).unwrap();
+    fs::write(leaf.join("main.srx"), "inputs { recipes = \"modules:recipes\"; } pub type X = recipes::leaf::X; pub fn make() -> X { recipes::leaf::make() }").unwrap();
+    fs::write(
+        leaf.join("recipes/leaf.srx"),
+        "pub struct X {} pub fn make() -> X { X {} }",
+    )
+    .unwrap();
+    fs::write(middle.join("main.srx"), "inputs { recipes = \"modules:recipes\"; leaf = \"path:../leaf\"; } pub type X = leaf::X; pub fn make() -> X { leaf::make() }").unwrap();
+    fs::write(middle.join("recipes/middle.srx"), "pub struct Local {}").unwrap();
+    fs::write(consumer.join("main.srx"), "inputs { recipes = \"modules:recipes\"; middle = \"path:../middle\"; } outputs { selected: middle::X = middle::make(); }").unwrap();
+    fs::write(consumer.join("recipes/consumer.srx"), "pub struct Local {}").unwrap();
+    lock_project(&leaf).unwrap();
+    lock_project(&middle).unwrap();
+    lock_project(&consumer).unwrap();
+    check_project_lock(&consumer).unwrap();
+}
+
+#[test]
+fn imported_projects_share_one_standard_library_budget() {
+    let workspace = TempProject::new();
+    let child = workspace.0.join("child");
+    let consumer = workspace.0.join("consumer");
+    fs::create_dir(&child).unwrap();
+    fs::create_dir(&consumer).unwrap();
+    let configuration = package_configuration();
+    fs::write(child.join("main.srx"), "pub struct X {}").unwrap();
+    fs::write(
+        consumer.join("main.srx"),
+        "inputs { child = \"path:../child\"; } outputs { selected: child::X = child::X {}; }",
+    )
+    .unwrap();
+    lock_project_with(&child, &configuration).unwrap();
+    let total = configuration
+        .standard_library
+        .as_ref()
+        .unwrap()
+        .sources()
+        .map(|source| source.text().len())
+        .sum::<usize>()
+        + fs::read(child.join("main.srx")).unwrap().len()
+        + fs::read(consumer.join("main.srx")).unwrap().len();
+    let mut limited = configuration.clone();
+    limited.project_limits.max_total_bytes = total;
+    lock_project_with(&consumer, &limited).unwrap();
+    limited.project_limits.max_total_bytes = total - 1;
+    assert!(matches!(
+        check_project_with(&consumer, &limited),
+        Err(CheckFailure::ProjectTooLarge { .. })
+    ));
+}
+
+#[test]
+fn imported_project_work_budget_is_shared_across_the_graph() {
+    let workspace = TempProject::new();
+    let child = workspace.0.join("child");
+    let consumer = workspace.0.join("consumer");
+    fs::create_dir(&child).unwrap();
+    fs::create_dir(&consumer).unwrap();
+    fs::write(child.join("main.srx"), "pub struct X {}").unwrap();
+    fs::write(
+        consumer.join("main.srx"),
+        "inputs { child = \"path:../child\"; }",
+    )
+    .unwrap();
+    lock_project(&child).unwrap();
+    let mut configuration = CheckConfiguration::default();
+    configuration.project_limits.max_work = 1;
+    assert!(matches!(
+        check_project_with(&consumer, &configuration),
+        Err(CheckFailure::WorkLimit { .. })
+    ));
+}
+
+#[test]
+fn external_and_local_inputs_with_the_same_relative_name_do_not_alias() {
+    let workspace = TempProject::new();
+    let child = workspace.0.join("dep");
+    let consumer = workspace.0.join("consumer");
+    fs::create_dir(&child).unwrap();
+    fs::create_dir_all(consumer.join("dep")).unwrap();
+    fs::write(child.join("main.srx"), "pub struct X {}").unwrap();
+    fs::write(consumer.join("dep/local.srx"), "pub struct Y {}").unwrap();
+    fs::write(consumer.join("main.srx"), "inputs { local = \"path:dep\"; external = \"path:../dep\"; } outputs { x: external::X = external::X {}; y: local::Y = local::Y {}; }").unwrap();
+    lock_project(&child).unwrap();
+    lock_project(&consumer).unwrap();
+    check_project_lock(&consumer).unwrap();
+}
+
+#[test]
+fn removing_the_last_child_does_not_silently_retain_a_stale_graph_lock() {
+    let workspace = TempProject::new();
+    let child = workspace.0.join("child");
+    let consumer = workspace.0.join("consumer");
+    fs::create_dir(&child).unwrap();
+    fs::create_dir(&consumer).unwrap();
+    fs::write(child.join("main.srx"), "pub struct X {}").unwrap();
+    fs::write(
+        consumer.join("main.srx"),
+        "inputs { dep = \"path:../child\"; }",
+    )
+    .unwrap();
+    lock_project(&child).unwrap();
+    lock_project(&consumer).unwrap();
+    fs::write(consumer.join("main.srx"), "pub struct Answer {}").unwrap();
+    assert!(matches!(
+        lock_project(&consumer).unwrap().status(),
+        crate::LockStatus::Updated
+    ));
+    assert!(!consumer.join("Syrox.graph.lock").exists());
+    check_project_lock(&consumer).unwrap();
+}
+
+#[test]
+fn removing_a_child_refuses_a_symlinked_graph_lock_without_mutating_the_parent() {
+    let workspace = TempProject::new();
+    let child = workspace.0.join("child");
+    let consumer = workspace.0.join("consumer");
+    fs::create_dir(&child).unwrap();
+    fs::create_dir(&consumer).unwrap();
+    fs::write(child.join("main.srx"), "pub struct X {}").unwrap();
+    fs::write(
+        consumer.join("main.srx"),
+        "inputs { dep = \"path:../child\"; }",
+    )
+    .unwrap();
+    lock_project(&child).unwrap();
+    lock_project(&consumer).unwrap();
+    let old_parent = fs::read(consumer.join(crate::LOCK_FILE_NAME)).unwrap();
+    symlink(child.join("main.srx"), consumer.join("Syrox.graph.lock")).unwrap();
+    fs::write(consumer.join("main.srx"), "pub struct Answer {}").unwrap();
+    assert!(matches!(
+        lock_project(&consumer),
+        Err(ProjectOperationError::LockSymlink)
+    ));
+    assert_eq!(
+        fs::read(consumer.join(crate::LOCK_FILE_NAME)).unwrap(),
+        old_parent
+    );
+}
+
+#[test]
+fn descriptor_pinned_child_snapshot_resolves_its_own_modules() {
+    let child = TempProject::new();
+    child.write("main.srx", "inputs { recipes = \"modules:recipes\"; } pub type X = recipes::hello::X; pub fn get() -> X { recipes::hello::make() }");
+    child.write(
+        "recipes/hello.srx",
+        "pub struct X {} pub fn make() -> X { X {} }",
+    );
+    lock_project_with(&child.0, &CheckConfiguration::default()).unwrap();
+    let mut sources = SourceSet::new();
+    sources
+        .add(
+            "consumer/main.srx",
+            "inputs { pkgs = \"path:../pkgs\"; } outputs { selected: pkgs::X = pkgs::get(); }",
+        )
+        .unwrap();
+    let mut budget = LoadBudget::new(ProjectLimits::default());
+    let mut directories = HashMap::new();
+    let mut files = HashMap::new();
+    let (domain, inputs) = loader::load_child_project_snapshot(
+        &mut sources,
+        SourceDomainId::project(),
+        "pkgs",
+        &child.0,
+        &mut loader::ChildSnapshotAdmission {
+            configuration: &CheckConfiguration::default(),
+            directory_identities: &mut directories,
+            file_identities: &mut files,
+            budget: &mut budget,
+        },
+    )
+    .unwrap();
+    assert_ne!(domain, SourceDomainId::project());
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].files().count(), 1);
+    let policy = CheckPolicy::default();
+    let checked = syrox_lang::check(
+        syrox_lang::resolve(syrox_lang::parse_sources(&sources).unwrap()).unwrap(),
+        &policy,
+    )
+    .unwrap();
+    let realized =
+        syrox_lang::evaluate(&checked, &policy, &EvaluationEnvironment::new(&policy)).unwrap();
+    assert!(realized.is_success());
+    assert_eq!(realized.roots().count(), 1);
+}
+
+#[test]
+fn child_snapshot_refuses_a_symlinked_source_before_granting_a_domain() {
+    let child = TempProject::new();
+    child.write("main.srx", "inputs { recipes = \"modules:recipes\"; }");
+    child.write("recipes/hello.srx", "pub struct X {}");
+    let target = child.0.join("recipes/hello.srx");
+    fs::rename(&target, child.0.join("real.srx")).unwrap();
+    symlink(child.0.join("real.srx"), &target).unwrap();
+    let mut sources = SourceSet::new();
+    let mut directories = HashMap::new();
+    let mut files = HashMap::new();
+    let mut budget = LoadBudget::new(ProjectLimits::default());
+    let result = loader::load_child_project_snapshot(
+        &mut sources,
+        SourceDomainId::project(),
+        "pkgs",
+        &child.0,
+        &mut loader::ChildSnapshotAdmission {
+            configuration: &CheckConfiguration::default(),
+            directory_identities: &mut directories,
+            file_identities: &mut files,
+            budget: &mut budget,
+        },
+    );
+    assert!(matches!(result, Err(CheckFailure::SymbolicLink { .. })));
+    assert!(sources.is_empty());
+}
+
+#[test]
+fn child_catalog_snapshot_exports_a_package_to_its_consumer() {
+    let child = TempProject::new();
+    child.write("main.srx", "inputs { catalog = \"modules:recipes\"; } outputs { catalog: std::Catalog = std::Catalog { input = \"catalog\"; }; }");
+    child.write(
+        "recipes/hello.srx",
+        "pub fn hello() -> std::Package { std::Package { id = \"hello\"; dependencies = []; } }",
+    );
+    let configuration = package_configuration();
+    lock_project_with(&child.0, &configuration).unwrap();
+    let mut sources = SourceSet::new();
+    sources
+        .add(
+            "consumer/main.srx",
+            "inputs { pkgs = \"path:../pkgs\"; } outputs { hello: std::Package = pkgs::hello; }",
+        )
+        .unwrap();
+    let mut directories = HashMap::new();
+    let mut files = HashMap::new();
+    let mut budget = LoadBudget::new(ProjectLimits::default());
+    loader::load_child_project_snapshot(
+        &mut sources,
+        SourceDomainId::project(),
+        "pkgs",
+        &child.0,
+        &mut loader::ChildSnapshotAdmission {
+            configuration: &configuration,
+            directory_identities: &mut directories,
+            file_identities: &mut files,
+            budget: &mut budget,
+        },
+    )
+    .unwrap();
+    for source in configuration.standard_library.as_ref().unwrap().sources() {
+        sources
+            .add_standard_library(source.name(), source.text())
+            .unwrap();
+    }
+    let policy = CheckPolicy::default();
+    let checked = syrox_lang::check(
+        syrox_lang::resolve(syrox_lang::parse_sources(&sources).unwrap()).unwrap(),
+        &policy,
+    )
+    .unwrap();
+    let realized =
+        syrox_lang::evaluate(&checked, &policy, &EvaluationEnvironment::new(&policy)).unwrap();
+    assert!(realized.is_success());
+    assert_eq!(realized.roots().count(), 1);
+}
+
+#[test]
+fn child_snapshot_requires_its_own_current_lock_before_exposing_sources() {
+    let child = TempProject::new();
+    child.write("main.srx", "inputs { dep = \"path:dep\"; }");
+    child.write("dep/one.srx", "pub struct One {}");
+    let load = || {
+        let mut sources = SourceSet::new();
+        let mut directories = HashMap::new();
+        let mut files = HashMap::new();
+        let mut budget = LoadBudget::new(ProjectLimits::default());
+        let result = loader::load_child_project_snapshot(
+            &mut sources,
+            SourceDomainId::project(),
+            "child",
+            &child.0,
+            &mut loader::ChildSnapshotAdmission {
+                configuration: &CheckConfiguration::default(),
+                directory_identities: &mut directories,
+                file_identities: &mut files,
+                budget: &mut budget,
+            },
+        );
+        (result.map(|_| ()), sources)
+    };
+    let (missing, sources) = load();
+    assert!(matches!(
+        missing,
+        Err(CheckFailure::MissingChildLock { .. })
+    ));
+    assert!(sources.is_empty());
+
+    lock_project_with(&child.0, &CheckConfiguration::default()).unwrap();
+    assert!(load().0.is_ok());
+    child.write("dep/two.srx", "pub struct Two {}");
+    let (drift, sources) = load();
+    assert!(matches!(drift, Err(CheckFailure::InvalidChildLock { .. })));
+    assert!(sources.is_empty());
+
+    fs::remove_file(child.0.join(crate::LOCK_FILE_NAME)).unwrap();
+    symlink(
+        child.0.join("main.srx"),
+        child.0.join(crate::LOCK_FILE_NAME),
+    )
+    .unwrap();
+    let (linked, sources) = load();
+    assert!(matches!(linked, Err(CheckFailure::InvalidChildLock { .. })));
+    assert!(sources.is_empty());
+}
+
+#[test]
+fn plan_rejects_function_values_nested_in_project_results() {
+    let result = package_plan(
+        "struct Holder { function: fn(std::Package) -> std::Package; } fn same(package: std::Package) -> std::Package { package } outputs { holder: Holder = Holder { function = same; }; }",
+    );
+    assert!(matches!(
+        result,
+        Err(ProjectOperationError::Plan(crate::PlanError::FunctionValue))
+    ));
+}
+
+#[test]
+fn package_factory_closure_composes_without_a_rust_package_case() {
+    let plan = package_plan(
+        "fn apply(factory: fn() -> std::Package) -> std::Package { factory() } outputs { pkg: std::Package = apply(fn() -> std::Package { std::Package { id = \"closure-pkg\"; dependencies = []; } }); }",
+    ).unwrap();
+    assert_eq!(
+        plan.packages()
+            .map(|package| package.id().as_str())
+            .collect::<Vec<_>>(),
+        ["closure-pkg"]
+    );
+}
+
+#[test]
+fn locked_catalog_discovers_factories_across_files_and_requires_relock_on_addition() {
+    let project = TempProject::new();
+    project.write(
+        "main.srx",
+        r#"inputs { catalog = "modules:recipes"; }
+        outputs { catalog: std::Catalog = std::Catalog { input = "catalog"; }; }"#,
+    );
+    project.write(
+        "recipes/hello.srx",
+        r#"
+        fn hello() -> std::Package { std::Package { id = "hello"; dependencies = []; } }
+        outputs { hello: fn() -> std::Package = hello; }
+    "#,
+    );
+    let configuration = package_configuration();
+    lock_project_with(&project.0, &configuration).unwrap();
+    let plan = plan_project_with(&project.0, &configuration).unwrap();
+    assert_eq!(
+        plan.packages().map(|p| p.id().as_str()).collect::<Vec<_>>(),
+        ["hello"]
+    );
+    assert_eq!(plan.packages().next().unwrap().export(), Some("hello"));
+
+    project.write(
+        "recipes/glibc.srx",
+        r#"
+        fn glibc() -> std::Package { std::Package { id = "glibc"; dependencies = []; } }
+        outputs { glibc: fn() -> std::Package = glibc; }
+    "#,
+    );
+    assert!(matches!(
+        plan_project_with(&project.0, &configuration),
+        Err(ProjectOperationError::ProjectDrift)
+    ));
+    lock_project_with(&project.0, &configuration).unwrap();
+    let plan = plan_project_with(&project.0, &configuration).unwrap();
+    assert_eq!(
+        plan.packages().map(|p| p.id().as_str()).collect::<Vec<_>>(),
+        ["glibc", "hello"]
+    );
+    assert_eq!(
+        plan.packages().map(|p| p.export()).collect::<Vec<_>>(),
+        [Some("glibc"), Some("hello")]
+    );
+}
+
+#[test]
+fn catalog_projection_rejects_conflicting_factories_across_files() {
+    let project = TempProject::new();
+    project.write(
+        "main.srx",
+        r#"inputs { catalog = "modules:recipes"; }
+        outputs { catalog: std::Catalog = std::Catalog { input = "catalog"; }; }"#,
+    );
+    let factory = r#"
+        fn hello() -> std::Package { std::Package { id = "hello"; dependencies = []; } }
+        outputs { hello: fn() -> std::Package = hello; }
+    "#;
+    project.write("recipes/one.srx", factory);
+    project.write("recipes/two.srx", factory);
+    assert!(matches!(
+        check_project_with(&project.0, &package_configuration()),
+        Err(CheckFailure::InvalidCatalog { reason }) if reason.contains("duplicate factory export")
+    ));
+}
+
+#[test]
+fn catalog_projection_rejects_conflict_with_explicit_root_export() {
+    let project = TempProject::new();
+    project.write(
+        "main.srx",
+        r#"inputs { catalog = "modules:recipes"; }
+        outputs {
+            catalog: std::Catalog = std::Catalog { input = "catalog"; };
+            hello: std::Package = std::Package { id = "hello"; dependencies = []; };
+        }"#,
+    );
+    project.write(
+        "recipes/hello.srx",
+        r#"fn hello() -> std::Package { std::Package { id = "hello"; dependencies = []; } }
+           outputs { hello: fn() -> std::Package = hello; }"#,
+    );
+    assert!(matches!(
+        check_project_with(&project.0, &package_configuration()),
+        Err(CheckFailure::Diagnostics { errors, .. })
+            if errors.iter().any(|error| error.message.contains("duplicate"))
+    ));
+}
+
+#[test]
+fn single_composite_recipe_exports_package_source_and_build() {
+    let project = TempProject::new();
+    project.write(
+        "main.srx",
+        r#"inputs { catalog = "modules:recipes"; }
+        outputs { catalog: std::Catalog = std::Catalog { input = "catalog"; }; }"#,
+    );
+    project.write(
+        "recipes/glibc.srx",
+        r#"fn recipe() -> std::Recipe<std::GlibcBuild> {
+            std::Recipe<std::GlibcBuild> {
+                package = std::Package { id = "glibc"; dependencies = []; };
+                acquisition = std::Acquisition {
+                    package = "glibc";
+                    sources = [std::SourceRequest {
+                        url = "https://example.test/glibc.tar.xz";
+                        sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+                        maximum_bytes = 33554432;
+                    }];
+                };
+                build = std::GlibcBuild {
+                    package = "glibc";
+                    source_directory = "glibc-2.44";
+                    entry = "usr/lib/ld-linux-x86-64.so.2";
+                    timeout_seconds = 1800;
+                };
+            }
+        }
+        outputs { glibc: fn() -> std::Recipe<std::GlibcBuild> = recipe; }"#,
+    );
+    let configuration = package_configuration();
+    lock_project_with(&project.0, &configuration).unwrap();
+    let plan = plan_project_with(&project.0, &configuration).unwrap();
+    assert_eq!(plan.packages().next().unwrap().export(), Some("glibc"));
+    assert_eq!(plan.acquisitions().count(), 1);
+    assert_eq!(plan.builds().next().unwrap().protocol(), "glibc");
+    assert_eq!(
+        plan.roots()
+            .filter(|root| root.name() == "glibc_build")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn public_factory_needs_no_repeated_output_signature() {
+    let project = TempProject::new();
+    project.write(
+        "main.srx",
+        r#"inputs { catalog = "modules:recipes"; }
+        outputs { catalog: std::Catalog = std::Catalog { input = "catalog"; }; }"#,
+    );
+    project.write(
+        "recipes/hello.srx",
+        r#"
+        fn private() -> std::Package { std::Package { id = "hello"; dependencies = []; } }
+        pub fn hello() -> std::Package { private() }
+    "#,
+    );
+    let configuration = package_configuration();
+    lock_project_with(&project.0, &configuration).unwrap();
+    let plan = plan_project_with(&project.0, &configuration).unwrap();
+    assert_eq!(plan.packages().next().unwrap().export(), Some("hello"));
+    assert_eq!(plan.packages().count(), 1);
+    project.write(
+        "main.srx",
+        r#"inputs { catalog = "modules:recipes"; }
+        outputs { secret: std::Package = catalog::private(); }"#,
+    );
+    let result = check_project_with(&project.0, &configuration);
+    assert!(
+        matches!(&result,
+        Err(CheckFailure::Diagnostics { errors, .. }) if errors.iter().any(|error| error.message.contains("private"))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn catalog_files_have_distinct_modules_and_package_entrypoints() {
+    let project = TempProject::new();
+    project.write(
+        "main.srx",
+        r#"inputs { catalog = "modules:recipes"; }
+        outputs { catalog: std::Catalog = std::Catalog { input = "catalog"; }; }"#,
+    );
+    project.write(
+        "recipes/hello/package.srx",
+        r#"
+        fn make() -> std::Package { std::Package { id = "hello"; dependencies = []; } }
+        pub fn recipe() -> std::Package { make() }
+    "#,
+    );
+    project.write(
+        "recipes/glibc/package.srx",
+        r#"
+        fn make() -> std::Package { std::Package { id = "glibc"; dependencies = []; } }
+        pub fn recipe() -> std::Package { make() }
+    "#,
+    );
+    let configuration = package_configuration();
+    lock_project_with(&project.0, &configuration).unwrap();
+    let plan = plan_project_with(&project.0, &configuration).unwrap();
+    assert_eq!(
+        plan.packages().map(|pkg| pkg.export()).collect::<Vec<_>>(),
+        [Some("glibc"), Some("hello")]
+    );
+    project.write(
+        "main.srx",
+        r#"inputs { catalog = "modules:recipes"; }
+        outputs {
+            catalog: std::Catalog = std::Catalog { input = "catalog"; };
+            private: std::Package = catalog::hello::make();
+        }"#,
+    );
+    let result = check_project_with(&project.0, &configuration);
+    assert!(
+        matches!(&result,
+        Err(CheckFailure::Diagnostics { errors, .. }) if errors.iter().any(|error| error.message.contains("private"))),
+        "{result:?}"
+    );
+    project.write(
+        "recipes/hello.srx",
+        "pub fn extra() -> std::Package { std::Package { id = \"extra\"; dependencies = []; } }",
+    );
+    assert!(matches!(check_project_with(&project.0, &configuration),
+        Err(CheckFailure::InvalidCatalog { reason }) if reason.contains("share one recipe module")));
+}
+
+#[test]
+fn modules_locator_is_a_general_locked_input_without_catalog_marker() {
+    let project = TempProject::new();
+    project.write(
+        "main.srx",
+        r#"inputs { dep = "modules:dep"; }
+        outputs {
+            hello: std::Package = dep::hello::make();
+            glibc: std::Package = dep::glibc::make();
+        }"#,
+    );
+    for name in ["hello", "glibc"] {
+        project.write(
+            &format!("dep/{name}.srx"),
+            &format!(
+                r#"
+            fn private() -> std::Package {{ std::Package {{ id = "{name}"; dependencies = []; }} }}
+            pub fn make() -> std::Package {{ private() }}
+        "#
+            ),
+        );
+    }
+    let configuration = package_configuration();
+    lock_project_with(&project.0, &configuration).unwrap();
+    let plan = plan_project_with(&project.0, &configuration).unwrap();
+    assert_eq!(
+        plan.packages().map(|pkg| pkg.export()).collect::<Vec<_>>(),
+        [Some("glibc"), Some("hello")]
+    );
+    project.write(
+        "dep/other.srx",
+        "pub fn unused() -> std::Package { std::Package { id = \"other\"; dependencies = []; } }",
+    );
+    assert!(matches!(
+        plan_project_with(&project.0, &configuration),
+        Err(ProjectOperationError::ProjectDrift)
+    ));
+}
+
+#[test]
+fn development_output_is_an_explicit_validated_build_edge() {
+    let config = package_configuration();
     let recipe = r#"outputs {
         glibc: std::Package = std::Package { id = "glibc"; dependencies = []; };
         glibc_source: std::Acquisition = std::Acquisition { package = "glibc"; sources = [std::SourceRequest { url = "project:glibc.tar.xz"; sha256 = "0000000000000000000000000000000000000000000000000000000000000000"; maximum_bytes = 33554432; }]; };
@@ -199,7 +1696,7 @@ fn syntax_errors_do_not_cross_file_boundaries() {
 #[test]
 fn project_rejects_unsafe_and_unsupported_locators() {
     for (locator, expected) in [
-        ("path:../outside", "relative"),
+        ("path:../../outside", "relative"),
         ("https:example.invalid", "unsupported locator"),
     ] {
         let project = TempProject::new();
@@ -788,6 +2285,80 @@ fn lock_failure_before_rename_preserves_the_previous_bytes() {
 }
 
 #[test]
+fn graph_lock_failure_before_rename_preserves_the_whole_previous_manifest() {
+    let workspace = TempProject::new();
+    let child = workspace.0.join("child");
+    let consumer = workspace.0.join("consumer");
+    fs::create_dir(&child).unwrap();
+    fs::create_dir(&consumer).unwrap();
+    fs::write(child.join("main.srx"), "pub struct X {}").unwrap();
+    fs::write(
+        consumer.join("main.srx"),
+        "inputs { child = \"path:../child\"; }",
+    )
+    .unwrap();
+    lock_project(&child).unwrap();
+    lock_project(&consumer).unwrap();
+    let previous = fs::read(consumer.join(crate::LOCK_FILE_NAME)).unwrap();
+    assert!(previous.starts_with(b"syrox-lock-v2\n"));
+    assert!(!consumer.join("Syrox.graph.lock").exists());
+    fs::write(child.join("main.srx"), "pub struct X {} // changed").unwrap();
+    lock_project(&child).unwrap();
+    crate::linux_fd::fail_next_lock_before_rename();
+    assert!(matches!(
+        lock_project(&consumer),
+        Err(ProjectOperationError::LockPublication(
+            LockPublicationError::BeforeRename { .. }
+        ))
+    ));
+    assert_eq!(
+        fs::read(consumer.join(crate::LOCK_FILE_NAME)).unwrap(),
+        previous
+    );
+    assert!(!consumer.join("Syrox.graph.lock").exists());
+    assert!(matches!(
+        check_project_lock(&consumer),
+        Err(ProjectOperationError::GraphDrift)
+    ));
+    lock_project(&consumer).unwrap();
+    check_project_lock(&consumer).unwrap();
+}
+
+#[test]
+fn legacy_sidecar_requires_relock_and_is_removed_after_single_manifest_publication() {
+    let workspace = TempProject::new();
+    let child = workspace.0.join("child");
+    let consumer = workspace.0.join("consumer");
+    fs::create_dir(&child).unwrap();
+    fs::create_dir(&consumer).unwrap();
+    fs::write(child.join("main.srx"), "pub struct X {}").unwrap();
+    fs::write(
+        consumer.join("main.srx"),
+        "inputs { child = \"path:../child\"; }",
+    )
+    .unwrap();
+    lock_project(&child).unwrap();
+    lock_project(&consumer).unwrap();
+    let current = fs::read(consumer.join(crate::LOCK_FILE_NAME)).unwrap();
+    let expected = crate::lock::graph::GraphLock::generate([0; 32], vec![]).unwrap();
+    fs::write(consumer.join("Syrox.graph.lock"), expected.data()).unwrap();
+    assert!(matches!(
+        check_project_lock(&consumer),
+        Err(ProjectOperationError::GraphDrift)
+    ));
+    assert!(matches!(
+        lock_project(&consumer).unwrap().status(),
+        crate::LockStatus::Updated
+    ));
+    assert!(!consumer.join("Syrox.graph.lock").exists());
+    assert_eq!(
+        fs::read(consumer.join(crate::LOCK_FILE_NAME)).unwrap(),
+        current
+    );
+    check_project_lock(&consumer).unwrap();
+}
+
+#[test]
 fn lock_failure_after_rename_reports_uncertainty_and_keeps_new_bytes() {
     let project = TempProject::new();
     project.write(
@@ -980,12 +2551,17 @@ fn plan_refuses_unowned_duplicate_and_invalid_source_requests() {
         invalid,
         ProjectOperationError::Plan(crate::PlanError::InvalidSourceRequest { .. })
     ));
-    let local = package_plan(&format!(r#"outputs {{
+    let local_project = TempProject::new();
+    local_project.write("assets/runtime.tar.gz", "a");
+    local_project.write("main.srx", &format!(r#"outputs {{
         package: std::Package = std::Package {{ id = "app"; dependencies = []; }};
         request: std::Acquisition = std::Acquisition {{ package = "app"; sources = [
             std::SourceRequest {{ url = "project:assets/runtime.tar.gz"; sha256 = "{}"; maximum_bytes = 2048; }}
         ]; }};
-    }}"#, "0".repeat(64))).unwrap();
+    }}"#, "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"));
+    let configuration = package_configuration();
+    lock_project_with(&local_project.0, &configuration).unwrap();
+    let local = plan_project_with(&local_project.0, &configuration).unwrap();
     assert_eq!(
         local
             .acquisitions()

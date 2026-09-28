@@ -61,6 +61,7 @@ pub fn evaluate_with_limits(
     let mut diagnostics_used = 0_usize;
     let mut total_steps = 0_usize;
     let mut retained_expansion = 0_usize;
+    let mut shared_outputs = BTreeMap::new();
     for source in program.resolved().parsed().iter() {
         if source.domain() != crate::SourceDomainId::project() {
             continue;
@@ -77,11 +78,10 @@ pub fn evaluate_with_limits(
                 if retained_expansion > limits.max_retained_expansion_bytes {
                     return Err(EvaluationSetupError::EvaluationRetainedExpansionLimit);
                 }
+                let remaining_bytes = limits.max_retained_expansion_bytes - retained_expansion;
                 let root_limits = EvaluationLimits {
                     max_total_steps: limits.max_total_steps.saturating_sub(total_steps),
-                    max_retained_expansion_bytes: limits
-                        .max_retained_expansion_bytes
-                        .saturating_sub(retained_expansion),
+                    max_retained_expansion_bytes: remaining_bytes,
                     max_diagnostics: limits.max_diagnostics.saturating_sub(diagnostics_used),
                     ..limits
                 };
@@ -97,6 +97,7 @@ pub fn evaluate_with_limits(
                     value.span,
                     root.clone(),
                 );
+                evaluator.inherit_outputs(std::mem::take(&mut shared_outputs));
                 let ty = evaluator.canonical_expression_type(value);
                 if let Some(error) = evaluator.operation_error {
                     return Err(error);
@@ -107,6 +108,7 @@ pub fn evaluate_with_limits(
                 if let Some(error) = evaluator.operation_error {
                     return Err(error);
                 }
+                shared_outputs = evaluator.take_shareable_outputs(evaluated.is_ok());
                 total_steps = total_steps.saturating_add(evaluator.steps);
                 retained_expansion = retained_expansion.saturating_add(evaluator.expansion);
                 if total_steps > limits.max_total_steps {

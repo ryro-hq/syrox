@@ -653,9 +653,13 @@ pub(crate) fn realize_build_with_runtime(
         let root = RootName::new(format!("source_{}", source.digest()))
             .expect("digest makes a bounded root");
         if let Some(relative) = source.url().strip_prefix("project:") {
+            let origin = source
+                .owner()
+                .and_then(|owner| resolved.plan.project_root(owner))
+                .ok_or(RealizeError::UnsupportedSource)?;
             acquire_build_local(
                 &store,
-                &resolved.project,
+                origin,
                 relative,
                 source.digest(),
                 source.maximum_bytes().min(maximum_source),
@@ -710,7 +714,7 @@ pub(crate) fn realize_build_with_runtime(
     Ok(result)
 }
 
-fn acquire_build_local(
+pub(crate) fn acquire_build_local(
     store: &Store,
     project_path: &Path,
     relative: &str,
@@ -719,9 +723,22 @@ fn acquire_build_local(
     root: &RootName,
     cancellation: &BuildCancellation,
 ) -> Result<(), RealizeError> {
-    let canonical_project = std::fs::canonicalize(project_path)?;
-    let project = crate::AuthorizedLocalDirectory::open(&canonical_project)?;
-    let path = canonical_project.join(relative);
+    let absolute = std::path::absolute(project_path)?;
+    // The loader already admitted every component without following symlinks.
+    // Remove lexical `..` left by a sibling locator before constructing the
+    // absolute file URL; canonicalize() here would follow a newly added symlink.
+    let mut project_path = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                project_path.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => project_path.push(other.as_os_str()),
+        }
+    }
+    let project = crate::AuthorizedLocalDirectory::open(&project_path)?;
+    let path = project_path.join(relative);
     let url = url::Url::from_file_path(&path)
         .map_err(|()| RealizeError::UnsupportedSource)?
         .to_string();

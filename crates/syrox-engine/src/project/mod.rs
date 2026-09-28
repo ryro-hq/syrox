@@ -1,10 +1,14 @@
 #[cfg(target_os = "linux")]
 mod analyze;
 #[cfg(target_os = "linux")]
+mod catalog;
+#[cfg(target_os = "linux")]
 mod loader;
 #[cfg(target_os = "linux")]
 mod locator;
+mod standard_library;
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::string::FromUtf8Error;
@@ -156,6 +160,25 @@ pub struct LoadedProjectSource {
     source_id: SourceId,
 }
 
+#[derive(Debug)]
+pub struct LoadedProjectAsset {
+    relative_path: PathBuf,
+    size: u64,
+    digest: [u8; 32],
+}
+
+impl LoadedProjectAsset {
+    pub fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+    pub const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
+
 impl LoadedProjectSource {
     pub fn relative_path(&self) -> &Path {
         &self.relative_path
@@ -200,6 +223,11 @@ pub struct LoadedProject {
     sources: SourceSet,
     main_source: SourceId,
     inputs: Vec<LoadedProjectInput>,
+    assets: Vec<LoadedProjectAsset>,
+    #[cfg(target_os = "linux")]
+    child_edges: Vec<crate::lock::graph::ProjectEdge>,
+    #[cfg(target_os = "linux")]
+    children: Vec<(String, std::sync::Arc<LoadedProject>)>,
 }
 
 impl LoadedProject {
@@ -223,6 +251,15 @@ impl LoadedProject {
 
     pub fn inputs(&self) -> impl ExactSizeIterator<Item = &LoadedProjectInput> {
         self.inputs.iter()
+    }
+
+    pub fn assets(&self) -> impl ExactSizeIterator<Item = &LoadedProjectAsset> {
+        self.assets.iter()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn child_edges(&self) -> &[crate::lock::graph::ProjectEdge] {
+        &self.child_edges
     }
 }
 
@@ -331,6 +368,16 @@ pub enum ProjectOperationError {
     },
     #[error("project sources have drifted from the lock")]
     ProjectDrift,
+    #[error("project graph lock has drifted from its authenticated child snapshots")]
+    GraphDrift,
+    #[error(
+        "project asset `{path}` is not authenticated in the consuming project with the requested digest"
+    )]
+    UnpinnedProjectAsset { path: String },
+    #[error("project source `{path}` has no authenticated project origin")]
+    UnknownProjectSourceOrigin { path: String },
+    #[error("project graph lock is malformed or noncanonical: {source}")]
+    MalformedGraphLock { source: crate::LockFormatError },
     #[error("authenticated standard library has drifted from the lock")]
     StandardLibraryDrift,
     #[error("project lock is a symbolic link")]
@@ -344,6 +391,8 @@ pub enum ProjectOperationError {
         #[source]
         source: io::Error,
     },
+    #[error("cannot remove obsolete graph lock: {source}")]
+    GraphRemoval { source: io::Error },
     #[error(transparent)]
     LockPublication(#[from] LockPublicationError),
     #[error(
@@ -403,6 +452,8 @@ pub enum CheckFailure {
     MissingMain { path: PathBuf },
     #[error("expected a regular .srx source file: {path}")]
     InvalidSourceFile { path: PathBuf },
+    #[error("expected a regular asset file: {path}")]
+    InvalidAssetFile { path: PathBuf },
     #[error("expected an input directory: {path}")]
     InputNotDirectory { path: PathBuf },
     #[error("symbolic links are not allowed in project sources: {path}")]
@@ -413,6 +464,18 @@ pub enum CheckFailure {
     UnsafeInputPath { name: String, path: PathBuf },
     #[error("duplicate project input name `{name}`")]
     DuplicateInputName { name: String },
+    #[error("invalid catalog export declaration: {reason}")]
+    InvalidCatalog { reason: String },
+    #[error("child project {path} has no {name}")]
+    MissingChildLock { path: PathBuf, name: &'static str },
+    #[error("child project {path} lock could not be verified: {reason}")]
+    InvalidChildLock { path: PathBuf, reason: String },
+    #[error("project snapshot contains a cycle or repeated directory: {path}")]
+    ChildProjectCycle { path: PathBuf },
+    #[error("project graph exceeds the configured input directory depth of {limit}")]
+    ProjectGraphDepth { limit: usize },
+    #[error("project has more than {limit} imported project edges")]
+    TooManyProjectEdges { limit: usize },
     #[error("input paths overlap and would alias source authority: {first} and {second}")]
     AliasedInputPaths { first: PathBuf, second: PathBuf },
     #[error("source files are aliases of the same filesystem object: {first} and {second}")]
@@ -713,7 +776,29 @@ fn compare_lock(
         Some(crate::lock::LockDrift::StandardLibrary) => {
             Err(ProjectOperationError::StandardLibraryDrift)
         }
+        Some(crate::lock::LockDrift::Graph) => Err(ProjectOperationError::GraphDrift),
     }
+}
+
+#[cfg(target_os = "linux")]
+const GRAPH_LOCK_FILE: &str = "Syrox.graph.lock";
+
+#[cfg(target_os = "linux")]
+fn read_graph_lock(
+    project: &LoadedProject,
+) -> Result<Option<crate::lock::graph::GraphLock>, ProjectOperationError> {
+    let bytes = crate::linux_fd::read_bounded_beneath(
+        project.root.fd(),
+        Path::new(GRAPH_LOCK_FILE),
+        MAX_LOCK_BYTES,
+    )
+    .map_err(map_lock_io)?;
+    bytes
+        .map(|bytes| {
+            crate::lock::graph::GraphLock::parse(&bytes)
+                .map_err(|source| ProjectOperationError::MalformedGraphLock { source })
+        })
+        .transpose()
 }
 
 #[cfg(target_os = "linux")]
@@ -724,10 +809,13 @@ fn lock_project_platform(
     let validated = loader::validate_project_linux(path, configuration)?;
     let expected = expected_lock(&validated, configuration)?;
     let existing = read_lock(validated.loaded())?;
-    let status = match existing {
-        None => crate::LockStatus::Created,
-        Some(ref existing) if existing.data() == expected.data() => crate::LockStatus::Unchanged,
-        Some(_) => crate::LockStatus::Updated,
+    let old_graph = read_graph_lock(validated.loaded())?;
+    let status = match (&existing, &old_graph) {
+        (None, _) => crate::LockStatus::Created,
+        (Some(existing), None) if existing.data() == expected.data() => {
+            crate::LockStatus::Unchanged
+        }
+        _ => crate::LockStatus::Updated,
     };
     if status != crate::LockStatus::Unchanged {
         crate::linux_fd::write_atomic_beneath(
@@ -736,6 +824,21 @@ fn lock_project_platform(
             expected.data(),
         )
         .map_err(map_lock_publication)?;
+    }
+    if old_graph.is_some() {
+        let opened = crate::linux_fd::open_existing_regular(
+            validated.loaded.root.fd(),
+            Path::new(GRAPH_LOCK_FILE),
+        )
+        .map_err(|source| ProjectOperationError::GraphRemoval { source })?;
+        crate::linux_fd::unlink_opened(
+            validated.loaded.root.fd(),
+            Path::new(GRAPH_LOCK_FILE),
+            opened.metadata().identity(),
+        )
+        .map_err(|source| ProjectOperationError::GraphRemoval { source })?;
+        crate::linux_fd::sync_directory(validated.loaded.root.fd())
+            .map_err(|source| ProjectOperationError::GraphRemoval { source })?;
     }
     Ok(LockReport {
         status,
@@ -763,6 +866,9 @@ fn check_project_lock_platform(
         name: crate::LOCK_FILE_NAME,
     })?;
     compare_lock(&actual, &expected)?;
+    if read_graph_lock(validated.loaded())?.is_some() {
+        return Err(ProjectOperationError::GraphDrift);
+    }
     Ok(LockReport {
         status: crate::LockStatus::Unchanged,
         check: validated.report(),
@@ -789,13 +895,74 @@ fn plan_project_platform(
         name: crate::LOCK_FILE_NAME,
     })?;
     compare_lock(&actual, &expected)?;
-    crate::Plan::from_realized(
+    if read_graph_lock(validated.loaded())?.is_some() {
+        return Err(ProjectOperationError::GraphDrift);
+    }
+    let mut plan = crate::Plan::from_realized(
         validated.realized(),
         *actual.digest(),
         configuration.policy.identity(),
         configuration.standard_library.as_ref(),
     )
-    .map_err(ProjectOperationError::from)
+    .map_err(ProjectOperationError::from)?;
+    let mut roots = BTreeMap::new();
+    collect_project_roots(
+        validated.loaded(),
+        validated.loaded(),
+        SourceDomainId::project(),
+        &mut roots,
+    );
+    for source in plan
+        .acquisitions()
+        .flat_map(crate::PlanAcquisition::sources)
+    {
+        if let Some(path) = source.url().strip_prefix("project:") {
+            let Some(owner) = source.owner().and_then(|domain| roots.get(&domain)) else {
+                return Err(ProjectOperationError::UnknownProjectSourceOrigin {
+                    path: path.to_owned(),
+                });
+            };
+            let Some(asset_path) = path.strip_prefix("assets/") else {
+                continue;
+            };
+            let relative = Path::new("assets").join(asset_path);
+            if !owner.assets().any(|asset| {
+                asset.relative_path() == relative
+                    && asset.digest() == source.digest().as_bytes()
+                    && asset.size() <= source.maximum_bytes()
+            }) {
+                return Err(ProjectOperationError::UnpinnedProjectAsset {
+                    path: relative.display().to_string(),
+                });
+            }
+        }
+    }
+    plan.bind_project_roots(
+        roots
+            .into_iter()
+            .map(|(domain, project)| (domain, project.path().to_path_buf()))
+            .collect(),
+    );
+    Ok(plan)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_project_roots<'a>(
+    root: &LoadedProject,
+    project: &'a LoadedProject,
+    domain: SourceDomainId,
+    roots: &mut BTreeMap<SourceDomainId, &'a LoadedProject>,
+) {
+    if roots.insert(domain, project).is_some() {
+        return;
+    }
+    for (alias, child) in &project.children {
+        let child_domain = root
+            .sources()
+            .child_project_domain(domain, alias)
+            .expect("validated child has a source domain");
+        collect_project_roots(root, child, child_domain, roots);
+    }
 }
 
 #[cfg(not(target_os = "linux"))]

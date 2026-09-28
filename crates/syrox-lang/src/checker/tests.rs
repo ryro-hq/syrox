@@ -34,6 +34,538 @@ fn aliases_expand_structurally_and_cycles_are_rejected() {
 }
 
 #[test]
+fn generic_aliases_and_public_templates_preserve_specialization() {
+    checked(
+        "struct Item {} struct Box<T> { item: T; } type Wrapped<T> = Box<T>; \
+         mod api { outputs { type Box = Box; type Wrapped = Wrapped; } } \
+         outputs { out: api::Wrapped<Item> = Box<Item> { item = Item {}; }; }",
+    );
+    checked(
+        "struct Item {} struct Box<T> { item: T; } type Wrapped<T> = Box<T>; \
+         outputs { out: Wrapped<Item> = Box<Item> { item = Item {}; }; }",
+    );
+    assert!(
+        messages("struct Box<T> {} type Wrapped<T> = Box<T>; type Bad = Wrapped;")
+            .iter()
+            .any(|message| message.contains("generic alias expects 1"))
+    );
+    assert!(
+        messages("struct Box<T> {} type Loop<T> = Loop<T>;")
+            .iter()
+            .any(|message| message.contains("cyclic type alias"))
+    );
+    let mut sources = SourceSet::new();
+    sources
+        .add("duplicate.srx", "type Alias<T, T> = T;")
+        .unwrap();
+    assert!(
+        resolve(parse_sources(&sources).unwrap())
+            .unwrap_err()
+            .iter()
+            .any(|error| error.message.contains("duplicate type parameter"))
+    );
+}
+
+#[test]
+fn generic_reexports_from_an_input_keep_their_original_type_identity() {
+    let mut sources = SourceSet::new();
+    sources
+        .add(
+            "main.srx",
+            r#"inputs { dep = "path:dep"; }
+        struct Item {}
+        outputs { result: dep::Wrapped<Item> = dep::Box<Item> { item = Item {}; }; }"#,
+        )
+        .unwrap();
+    let input = sources.create_input_domain("dep").unwrap();
+    sources
+        .add_to_input_domain(
+            input,
+            "dep/box.srx",
+            r"
+        struct Box<T> { item: T; }
+        type Wrapped<T> = Box<T>;
+        outputs { type Wrapped = Wrapped; type Box = Box; }
+    ",
+        )
+        .unwrap();
+    check(
+        resolve(parse_sources(&sources).unwrap()).unwrap(),
+        &CheckPolicy::default(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn public_type_and_function_are_exported_without_an_outputs_block() {
+    let mut sources = SourceSet::new();
+    sources
+        .add(
+            "main.srx",
+            r#"inputs { dep = "path:dep"; }
+        outputs { result: dep::Box<dep::Item> = dep::make(); }"#,
+        )
+        .unwrap();
+    let input = sources.create_input_domain("dep").unwrap();
+    sources
+        .add_to_input_domain(
+            input,
+            "dep/lib.srx",
+            r"
+        pub struct Item {}
+        pub struct Box<T> { item: T; }
+        pub fn make() -> Box<Item> { Box<Item> { item = Item {}; } }
+    ",
+        )
+        .unwrap();
+    check(
+        resolve(parse_sources(&sources).unwrap()).unwrap(),
+        &CheckPolicy::default(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn public_declarations_cannot_repeat_explicit_exports() {
+    let mut sources = SourceSet::new();
+    sources.add("main.srx", "pub fn make() -> Item { Item {} } struct Item {} outputs { make: fn() -> Item = make; }").unwrap();
+    assert!(
+        resolve(parse_sources(&sources).unwrap())
+            .unwrap_err()
+            .iter()
+            .any(|error| error.message.contains("duplicate output name"))
+    );
+}
+
+#[test]
+fn public_import_reexports_the_original_item_identity() {
+    let mut sources = SourceSet::new();
+    sources
+        .add(
+            "main.srx",
+            r#"inputs { dep = "path:dep"; }
+        mod facade { pub use dep::Item; }
+        outputs { result: facade::Item = dep::Item {}; }"#,
+        )
+        .unwrap();
+    let dep = sources.create_input_domain("dep").unwrap();
+    sources
+        .add_to_input_domain(dep, "dep/item.srx", "pub struct Item {}")
+        .unwrap();
+    check(
+        resolve(parse_sources(&sources).unwrap()).unwrap(),
+        &CheckPolicy::default(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn function_value_signature_and_callee_are_checked() {
+    assert!(messages("value I(int); value S(str); fn id(x: I) -> I { x } fn use_it(f: fn(S) -> S) -> S { f(S(\"ok\")) } outputs { bad: S = use_it(id); }")
+        .iter().any(|message| message.contains("call argument type mismatch")));
+    assert!(
+        messages("value I(int); fn bad(x: I) -> I { x(I(2)) }")
+            .iter()
+            .any(|message| message.contains("callee is not a function value"))
+    );
+}
+
+#[test]
+fn generic_functions_reject_duplication_and_invalid_specializations() {
+    for source in [
+        "fn duplicate<T>(x: T) -> [T] { [x, x] }",
+        "fn captured<T>(x: T) -> fn() -> T { fn() -> T { x } }",
+        "value I(int); fn id<T>(x: T) -> T { x } fn bad() -> I { let unresolved = id; I(1) }",
+        "value I(int); fn id<T>(x: T) -> T { x } outputs { bad: I = id<I, I>(I(1)); }",
+        "value I(int); value S(str); fn id<T>(x: T) -> T { x } outputs { bad: I = id<I>(S(\"wrong\")); }",
+        "value I(int); fn id<T>(x: T) -> T { x } outputs { bad: [I] = fold([I(1)], [], id<I>); }",
+    ] {
+        assert!(!messages(source).is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn local_generic_inference_rejects_ambiguity_conflicts_and_double_moves() {
+    for (source, expected) in [
+        (
+            "value I(int); fn phantom<T>(x: I) -> I { x } outputs { bad: I = phantom(I(1)); }",
+            "cannot infer all generic arguments",
+        ),
+        (
+            "value I(int); value S(str); fn same<T>(left: T, right: T) -> T { left } outputs { bad: I = same(I(1), S(\"x\")); }",
+            "inferred generic argument type mismatch",
+        ),
+        (
+            "resource R(int); fn pair<T>(left: T, right: T) -> [T] { [left, right] } fn bad(r: R) -> [R] { pair(r, r) }",
+            "use of moved affine value",
+        ),
+        (
+            "value I(int); enum Option<T> { None, Some(T) } fn bad() -> I { let x = Option::None(); I(1) }",
+            "cannot infer all generic arguments",
+        ),
+        (
+            "value I(int); value S(str); fn id<T>(x: T) -> T { x } fn bad() -> fn(I) -> S { id }",
+            "inferred generic argument type mismatch",
+        ),
+    ] {
+        let diagnostics = messages(source);
+        assert!(
+            diagnostics.iter().any(|message| message.contains(expected)),
+            "{source}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn comparisons_join_affine_moves_and_require_ordered_matching_operands() {
+    checked("resource R(int); fn pick(r: R) -> R { compare(1, 2, r, r, r) }");
+    for (source, expected) in [
+        (
+            "resource R(int); fn bad(r: R) -> [R] { let selected = compare(1, 2, [r], [], []); selected ++ [r] }",
+            "use of moved affine value",
+        ),
+        (
+            "resource R(int); fn bad(r: R) -> R { compare(1, 2, r, r, r); r }",
+            "use of moved affine value",
+        ),
+        (
+            "value I(int); fn bad() -> I { compare(1, \"x\", I(1), I(2), I(3)) }",
+            "comparison operand type mismatch",
+        ),
+        (
+            "resource R(int); value I(int); fn bad(a: R, b: R) -> I { compare(a, b, I(1), I(2), I(3)) }",
+            "comparison requires",
+        ),
+        (
+            "value I(int); fn bad() -> I { compare([], [], I(1), I(2), I(3)) }",
+            "empty list requires",
+        ),
+        (
+            "value I(int); value S(str); fn bad() -> I { compare(1, 2, I(1), S(\"x\"), I(3)) }",
+            "comparison branch type mismatch",
+        ),
+    ] {
+        let diagnostics = messages(source);
+        assert!(
+            diagnostics.iter().any(|message| message.contains(expected)),
+            "{source}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn inferred_function_and_enum_instances_use_the_shared_budget() {
+    for source in [
+        "value I(int); value S(str); fn id<T>(x: T) -> T { x } outputs { a: I = id(I(1)); b: S = id(S(\"x\")); }",
+        "value I(int); value S(str); enum Option<T> { None, Some(T) } outputs { a: Option<I> = Option::Some(I(1)); b: Option<S> = Option::Some(S(\"x\")); }",
+    ] {
+        let errors = check_with_limits(
+            resolved(source),
+            &CheckPolicy::default(),
+            CheckLimits {
+                max_generic_instances: 1,
+                ..CheckLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("generic instance limit")),
+            "{errors:?}"
+        );
+    }
+}
+
+#[test]
+fn payload_enum_patterns_are_exhaustive_scoped_and_affine() {
+    for (source, expected) in [
+        (
+            "resource R(int); enum Maybe<T> { None, Some(T) } fn bad(x: Maybe<[[R]]>) -> [Maybe<[[R]]>] { [x, x] }",
+            "use of moved affine value",
+        ),
+        (
+            "value I(int); enum Maybe<T> { None, Some(T) } fn bad(x: Maybe<once fn() -> I>) -> [I] { match x { Some(f) => [f(), f()], None => [] } }",
+            "use of moved affine value",
+        ),
+        (
+            "resource R(int); enum Maybe<T> { None, Some(T) } fn bad(x: Maybe<R>) -> [R] { match x { Some(r) => [r, r], None => [] } }",
+            "use of moved affine value",
+        ),
+        (
+            "resource R(int); enum Maybe<T> { None, Some(T) } fn bad(x: Maybe<R>) -> [Maybe<R>] { [x, x] }",
+            "use of moved affine value",
+        ),
+        (
+            "value I(int); enum Maybe<T> { None, Some(T) } fn bad(x: Maybe<I>) -> [I] { match x { None => [] } }",
+            "match is not exhaustive",
+        ),
+        (
+            "value I(int); enum Maybe<T> { None, Some(T) } fn bad(x: Maybe<I>) -> [I] { match x { Some => [], None => [] } }",
+            "pattern payload binding count mismatch",
+        ),
+        (
+            "value I(int); enum Maybe<T> { None, Some(T) } fn bad(x: Maybe<I>) -> [I] { match x { Some(a, b) => [a], None => [] } }",
+            "pattern payload binding count mismatch",
+        ),
+        (
+            "value I(int); enum Maybe<T> { None, Some(T) } outputs { bad: Maybe<I> = Maybe::Some<I>(); }",
+            "expected 1 argument",
+        ),
+        (
+            "value I(int); enum Maybe<T> { None, Some(T) } outputs { bad: Maybe<I> = Maybe::Some; }",
+            "payload requires a constructor",
+        ),
+    ] {
+        assert!(
+            messages(source)
+                .iter()
+                .any(|message| message.contains(expected)),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn consumable_closures_move_captures_and_cannot_be_called_twice() {
+    for source in [
+        "resource R(int); fn bad(r: R) -> R { let f = once fn() -> R { r }; r }",
+        "resource R(int); fn bad(r: R) -> [R] { let f = once fn() -> R { r }; [f(), f()] }",
+        "resource R(int); fn bad(r: R) -> [R] { let moved = r; let f = once fn() -> R { r }; [moved, f()] }",
+        "resource R(int); struct H { deferred: once fn() -> R; } fn bad(h: H) -> [H] { [h, h] }",
+        "resource R(int); fn bad(r: R) -> fn() -> R { once fn() -> R { r } }",
+        "resource R(int); fn bad(r: R) -> [R] { fold([r], [], once fn(acc: [R], x: R) -> [R] { acc ++ [x] }) }",
+    ] {
+        assert!(!messages(source).is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn generic_function_instances_share_the_checker_instance_budget() {
+    let program = resolved(
+        "value I(int); value S(str); fn id<T>(x: T) -> T { x } outputs { first: I = id<I>(I(1)); second: S = id<S>(S(\"s\")); }",
+    );
+    let errors = check_with_limits(
+        program,
+        &CheckPolicy::default(),
+        CheckLimits {
+            max_generic_instances: 1,
+            ..CheckLimits::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.message.contains("generic instance limit"))
+    );
+}
+
+#[test]
+fn function_list_element_signature_must_match() {
+    assert!(messages(
+        "value I(int); value S(str); fn id(x: I) -> I { x } outputs { bad: [fn(S) -> S] = [id]; }"
+    ).iter().any(|message| message.contains("type mismatch")));
+    check(
+        resolved("value I(int); outputs { good: [[I]] = [[I(1)], []]; }"),
+        &CheckPolicy::default(),
+    )
+    .unwrap();
+    assert!(messages("resource R(int); struct Holder { items: [[R]]; } fn bad(h: Holder) -> Holder { let first = h; h }")
+        .iter().any(|message| message.contains("use of moved affine value")));
+}
+
+#[test]
+fn closure_rejects_affine_capture_and_checks_return_type() {
+    assert!(
+        messages("resource R(int); fn bad(r: R) -> fn() -> R { fn() -> R { r } }")
+            .iter()
+            .any(|message| message.contains("closure cannot capture an affine value"))
+    );
+    assert!(
+        messages(
+            "value I(int); value S(str); fn bad() -> fn() -> I { fn() -> I { S(\"wrong\") } }"
+        )
+        .iter()
+        .any(|message| message.contains("closure return type mismatch"))
+    );
+}
+
+#[test]
+fn imported_projects_resolve_their_own_input_aliases() {
+    let mut sources = SourceSet::new();
+    sources
+        .add(
+            "consumer/main.srx",
+            r#"inputs { pkgs = "path:../pkgs"; recipes = "path:local"; }
+        outputs { from_child: pkgs::X = pkgs::get(); from_local: recipes::X = recipes::make(); }"#,
+        )
+        .unwrap();
+    let child = sources
+        .create_project_domain(SourceDomainId::project(), "pkgs")
+        .unwrap();
+    sources
+        .add_to_project_domain(
+            child,
+            "pkgs/main.srx",
+            r#"inputs { recipes = "path:recipes"; }
+        pub type X = recipes::X; pub fn get() -> X { recipes::make() }"#,
+        )
+        .unwrap();
+    let child_recipes = sources.create_child_input_domain(child, "recipes").unwrap();
+    sources
+        .add_to_input_domain(
+            child_recipes,
+            "pkgs/recipes/item.srx",
+            "pub struct X {} pub fn make() -> X { X {} }",
+        )
+        .unwrap();
+    let local = sources.create_input_domain("recipes").unwrap();
+    sources
+        .add_to_input_domain(
+            local,
+            "consumer/local/item.srx",
+            "pub struct X {} pub fn make() -> X { X {} }",
+        )
+        .unwrap();
+    let checked = check(
+        resolve(parse_sources(&sources).unwrap()).unwrap(),
+        &CheckPolicy::default(),
+    )
+    .unwrap();
+    let policy = CheckPolicy::default();
+    let result = crate::evaluate(
+        &checked,
+        &policy,
+        &crate::EvaluationEnvironment::new(&policy),
+    )
+    .unwrap();
+    assert_eq!(result.roots().count(), 2);
+    assert!(result.is_success());
+
+    let mut isolated = SourceSet::new();
+    isolated
+        .add(
+            "consumer/main.srx",
+            "inputs { pkgs = \"path:../pkgs\"; recipes = \"path:local\"; }",
+        )
+        .unwrap();
+    let child = isolated
+        .create_project_domain(SourceDomainId::project(), "pkgs")
+        .unwrap();
+    isolated
+        .add_to_project_domain(
+            child,
+            "pkgs/main.srx",
+            "pub fn bad(x: recipes::X) -> recipes::X { x }",
+        )
+        .unwrap();
+    let local = isolated.create_input_domain("recipes").unwrap();
+    isolated
+        .add_to_input_domain(local, "consumer/local/item.srx", "pub struct X {}")
+        .unwrap();
+    assert!(
+        resolve(parse_sources(&isolated).unwrap())
+            .unwrap_err()
+            .iter()
+            .any(|error| error.message.contains("unknown type"))
+    );
+}
+
+#[test]
+fn imported_project_value_outputs_are_checked_and_realized_on_reference() {
+    let mut sources = SourceSet::new();
+    sources
+        .add(
+            "consumer/main.srx",
+            "inputs { dep = \"path:child\"; } outputs { selected: dep::X = dep::selected; }",
+        )
+        .unwrap();
+    let child = sources
+        .create_project_domain(SourceDomainId::project(), "dep")
+        .unwrap();
+    sources.add_to_project_domain(child, "child/main.srx", "pub struct X {} fn forever() -> X { forever() } outputs { selected: X = X {}; disconnected: X = forever(); }").unwrap();
+    let policy = CheckPolicy::default();
+    let checked = check(resolve(parse_sources(&sources).unwrap()).unwrap(), &policy).unwrap();
+    let result = crate::evaluate(
+        &checked,
+        &policy,
+        &crate::EvaluationEnvironment::new(&policy),
+    )
+    .unwrap();
+    assert_eq!(result.roots().count(), 1);
+    assert!(result.is_success());
+
+    let mut cyclic = SourceSet::new();
+    cyclic
+        .add(
+            "consumer/main.srx",
+            "inputs { dep = \"path:child\"; } outputs { selected: dep::X = dep::a; }",
+        )
+        .unwrap();
+    let child = cyclic
+        .create_project_domain(SourceDomainId::project(), "dep")
+        .unwrap();
+    cyclic
+        .add_to_project_domain(
+            child,
+            "child/main.srx",
+            "pub struct X {} outputs { a: X = b; b: X = a; }",
+        )
+        .unwrap();
+    let checked = check(resolve(parse_sources(&cyclic).unwrap()).unwrap(), &policy).unwrap();
+    let result = crate::evaluate(
+        &checked,
+        &policy,
+        &crate::EvaluationEnvironment::new(&policy),
+    )
+    .unwrap();
+    assert!(
+        result
+            .diagnostics()
+            .any(|error| error.message.contains("cycle in imported value outputs"))
+    );
+    let mut affine = SourceSet::new();
+    affine
+        .add(
+            "consumer/main.srx",
+            "inputs { dep = \"path:child\"; } outputs { selected: dep::R = dep::port; }",
+        )
+        .unwrap();
+    let child = affine
+        .create_project_domain(SourceDomainId::project(), "dep")
+        .unwrap();
+    affine
+        .add_to_project_domain(
+            child,
+            "child/main.srx",
+            "pub resource R(int); outputs { port: R = R(1); }",
+        )
+        .unwrap();
+    assert!(
+        check(resolve(parse_sources(&affine).unwrap()).unwrap(), &policy)
+            .unwrap_err()
+            .iter()
+            .any(|error| error
+                .message
+                .contains("imported value output cannot carry an affine resource"))
+    );
+}
+
+#[test]
+fn public_import_conflicts_with_a_repeated_output_export() {
+    let mut sources = SourceSet::new();
+    sources.add("main.srx", "mod base { struct Item {} outputs { type Item = Item; } } mod facade { pub use base::Item; outputs { type Item = base::Item; } }").unwrap();
+    let errors = resolve(parse_sources(&sources).unwrap()).unwrap_err();
+    assert!(
+        errors.iter().any(|error| error
+            .message
+            .contains("public import conflicts with an export")),
+        "{errors:?}"
+    );
+}
+
+#[test]
 fn alias_cycles_through_lists_terminate_and_share_the_depth_budget() {
     for text in [
         "type A = [A];",
@@ -69,7 +601,7 @@ fn alias_cycles_through_lists_terminate_and_share_the_depth_budget() {
 }
 
 #[test]
-fn generic_arity_and_scalar_arguments_are_checked() {
+fn generic_arity_and_composite_arguments_are_checked() {
     checked(
         "struct S {} struct Box<T> { item: T; } struct Outer<T> { inner: Box<T>; } outputs { out: Outer<S> = Outer<S> { inner = Box<S> { item = S {}; }; }; }",
     );
@@ -78,10 +610,8 @@ fn generic_arity_and_scalar_arguments_are_checked() {
             .iter()
             .any(|message| message.contains("expects 1 type argument"))
     );
-    assert!(
-        messages("struct Box<T> {} struct S {} type Bad = Box<[S]>;")
-            .iter()
-            .any(|message| message.contains("concrete scalar"))
+    checked(
+        "struct Box<T> { item: T; } struct S {} type Nested<T> = Box<[[T]]>; outputs { out: Nested<S> = Box<[[S]]> { item = [[S {}]]; }; }",
     );
 }
 

@@ -72,7 +72,7 @@ pub(super) fn extract(
             root: name.clone(),
             reason,
         };
-        let Some(Value::Struct { ty, fields }) = root.value() else {
+        let Some(Value::Struct { ty, fields, .. }) = root.value() else {
             return Err(invalid("expected an exact std application struct"));
         };
         let is_default = exact_nominal(ty, DEFAULT_PATH);
@@ -186,7 +186,7 @@ fn decode_role(
     let mut result = budget.collection::<PlanPackageId>(items.len())?;
     for item in items {
         budget.node::<PlanPackageId>()?;
-        let Value::Struct { ty, fields } = item else {
+        let Value::Struct { ty, fields, .. } = item else {
             return Err(invalid("runtime provider is not a struct"));
         };
         if !exact_nominal(ty, path) || fields.len() != 1 || fields[0].0 != "package" {

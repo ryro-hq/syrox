@@ -7,6 +7,21 @@ use super::{
 use crate::{CanonicalItemIdentity, Expression, ItemId, LocalId, Span, Ty};
 
 impl Evaluator<'_> {
+    pub(super) fn substitute_bindings(
+        &mut self,
+        bindings: &BTreeMap<LocalId, Ty>,
+        outer: &BTreeMap<LocalId, Ty>,
+        span: Span,
+    ) -> Eval<BTreeMap<LocalId, Ty>> {
+        self.expand(
+            bindings.len().saturating_mul(size_of::<(LocalId, Ty)>()),
+            span,
+        )?;
+        bindings
+            .iter()
+            .map(|(id, ty)| Ok((*id, self.substitute_ty(ty, outer, span)?)))
+            .collect()
+    }
     pub(super) fn canonical_expression_type(
         &mut self,
         expression: &Expression,
@@ -102,6 +117,26 @@ impl Evaluator<'_> {
                     depth + 1,
                 )?)))
             }
+            Ty::Function {
+                parameters,
+                result,
+                once,
+            } => {
+                self.expand(parameters.len().saturating_mul(size_of::<Ty>()), span)?;
+                Ok(Ty::Function {
+                    once: *once,
+                    parameters: parameters
+                        .iter()
+                        .map(|ty| self.substitute_ty_inner(ty, substitutions, span, depth + 1))
+                        .collect::<Eval<Vec<_>>>()?,
+                    result: Box::new(self.substitute_ty_inner(
+                        result,
+                        substitutions,
+                        span,
+                        depth + 1,
+                    )?),
+                })
+            }
             Ty::Unit | Ty::Int | Ty::Str | Ty::Nominal(_) => Ok(ty.clone()),
             Ty::Error => self.fail(span, "checked expression contains an error type"),
         }
@@ -175,6 +210,31 @@ impl Evaluator<'_> {
                 let element = self.canonical_concrete_ty(element, span, depth + 1)?;
                 self.canonical_leaf(CanonicalType::List(element), span)
             }
+            Ty::Function {
+                parameters,
+                result,
+                once,
+            } => {
+                self.expand(
+                    parameters
+                        .len()
+                        .saturating_mul(size_of::<Arc<CanonicalType>>()),
+                    span,
+                )?;
+                let parameters = parameters
+                    .iter()
+                    .map(|ty| self.canonical_concrete_ty(ty, span, depth + 1))
+                    .collect::<Eval<Vec<_>>>()?;
+                let result = self.canonical_concrete_ty(result, span, depth + 1)?;
+                self.canonical_leaf(
+                    CanonicalType::Function {
+                        parameters,
+                        result,
+                        once: *once,
+                    },
+                    span,
+                )
+            }
             Ty::Parameter(_) => {
                 self.fail(span, "canonical type contains an unsubstituted parameter")
             }
@@ -210,6 +270,13 @@ pub(super) fn type_allocation_bytes(ty: &Ty) -> usize {
             .saturating_mul(size_of::<Ty>())
             .saturating_add(arguments.iter().map(type_allocation_bytes).sum::<usize>()),
         Ty::List(element) => size_of::<Ty>().saturating_add(type_allocation_bytes(element)),
+        Ty::Function {
+            parameters, result, ..
+        } => parameters
+            .len()
+            .saturating_mul(size_of::<Ty>())
+            .saturating_add(parameters.iter().map(type_allocation_bytes).sum::<usize>())
+            .saturating_add(type_allocation_bytes(result)),
         Ty::Unit | Ty::Int | Ty::Str | Ty::Parameter(_) | Ty::Nominal(_) | Ty::Error => 0,
     }
 }

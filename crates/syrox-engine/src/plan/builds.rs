@@ -106,7 +106,7 @@ pub(super) fn extract(
             root: name.clone(),
             reason,
         };
-        let Some(Value::Struct { ty, fields }) = root.value() else {
+        let Some(Value::Struct { ty, fields, .. }) = root.value() else {
             return Err(invalid("expected an exact std build struct"));
         };
         let is_default = exact_nominal(ty, DEFAULT_PATH);
@@ -227,7 +227,7 @@ fn extract_build_inputs(
             root: name.clone(),
             reason,
         };
-        let Some(Value::Struct { ty, fields }) = root.value() else {
+        let Some(Value::Struct { ty, fields, .. }) = root.value() else {
             return Err(invalid("expected exact std build inputs"));
         };
         if !exact_nominal(ty, INPUTS_PATH)
@@ -254,7 +254,7 @@ fn extract_build_inputs(
                 "this build requires exactly one development output",
             ));
         }
-        let Value::Struct { ty, fields } = &items[0] else {
+        let Value::Struct { ty, fields, .. } = &items[0] else {
             return Err(invalid("invalid development output"));
         };
         if !exact_nominal(ty, OUTPUT_PATH)

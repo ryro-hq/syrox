@@ -204,6 +204,17 @@ fn long_concat_and_field_chains_are_flat() {
 }
 
 #[test]
+fn postfix_calls_and_fields_have_a_bounded_expression_depth() {
+    let text = format!("fn nested() {{ f{} }}", "().field".repeat(MAX_DEPTH));
+    let source = Source::new("nested.srx", text).unwrap();
+    assert!(analyze(&source).unwrap_err().iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("chain exceeds syntax nesting limit")
+    }));
+}
+
+#[test]
 fn invalid_empty_and_string_forms_are_rejected() {
     let cases = [
         ("empty generic", "type T = Generic<>;"),

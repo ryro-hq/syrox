@@ -1,7 +1,10 @@
 //! Type, policy and affine ownership checking for resolved Syrox programs.
 
+mod enums;
 mod expressions;
+mod functions;
 mod index;
+mod inference;
 mod model;
 mod ownership;
 mod policy;
@@ -33,6 +36,12 @@ struct StructInfo<'a> {
     parameters: Vec<LocalId>,
 }
 
+#[derive(Clone)]
+struct AliasInfo<'a> {
+    declaration: &'a TypeAlias,
+    parameters: Vec<LocalId>,
+}
+
 #[derive(Clone, Copy)]
 struct FunctionInfo<'a> {
     declaration: &'a Function,
@@ -53,6 +62,11 @@ enum RawTy {
         arguments: Vec<RawTy>,
     },
     List(Box<RawTy>),
+    Function {
+        parameters: Vec<RawTy>,
+        result: Box<RawTy>,
+        once: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -77,11 +91,12 @@ struct Checker<'a> {
     item_at: BTreeMap<(u32, u32, u32), ItemId>,
     module_by_path: BTreeMap<SourceDomainId, BTreeMap<&'a [String], ModuleId>>,
     item_context: BTreeMap<ItemId, Context>,
-    aliases: BTreeMap<ItemId, &'a TypeAlias>,
+    aliases: BTreeMap<ItemId, AliasInfo<'a>>,
     structs: BTreeMap<ItemId, StructInfo<'a>>,
     enums: BTreeMap<ItemId, &'a Enum>,
     primitives: BTreeMap<ItemId, PrimitiveInfo<'a>>,
     functions: BTreeMap<ItemId, FunctionInfo<'a>>,
+    output_values: BTreeMap<ItemId, &'a Type>,
     carriers: BTreeSet<ItemId>,
     generic_instances: BTreeSet<Ty>,
     struct_fields: BTreeMap<ItemId, Vec<(String, RawTy, bool)>>,
@@ -115,6 +130,7 @@ impl<'a> Checker<'a> {
             enums: BTreeMap::new(),
             primitives: BTreeMap::new(),
             functions: BTreeMap::new(),
+            output_values: BTreeMap::new(),
             carriers: BTreeSet::new(),
             generic_instances: BTreeSet::new(),
             struct_fields: BTreeMap::new(),

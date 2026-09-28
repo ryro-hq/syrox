@@ -22,6 +22,670 @@ fn identity(path: &str) -> CanonicalItemIdentity {
 }
 
 #[test]
+fn functions_pass_as_values_and_locals_call_through_typed_parameters() {
+    let program = run(
+        "value I(int); fn id(x: I) -> I { x } fn apply(f: fn(I) -> I, x: I) -> I { f(x) } fn indirect(x: I) -> I { let f = id; f(x) } outputs { first: I = apply(id, I(7)); second: I = indirect(I(9)); }",
+        &CheckPolicy::default(),
+    );
+    let values: Vec<_> = program.roots().map(|root| root.value().unwrap()).collect();
+    assert!(matches!(
+        values.as_slice(),
+        [
+            Value::Nominal {
+                value: PrimitiveValue::Int(7),
+                ..
+            },
+            Value::Nominal {
+                value: PrimitiveValue::Int(9),
+                ..
+            }
+        ]
+    ));
+}
+
+#[test]
+fn generic_functions_specialize_as_values_and_compose() {
+    let program = run(
+        r#"
+        value I(int);
+        value S(str);
+        fn id<T>(x: T) -> T { x }
+        fn apply<T, U>(f: fn(T) -> U, x: T) -> U { f(x) }
+        fn wrap<T, U>(f: fn(T) -> U) -> fn(T) -> U {
+            fn(x: T) -> U { apply<T, U>(f, x) }
+        }
+        outputs {
+            first: I = apply<I, I>(id<I>, I(7));
+            second: S = wrap<S, S>(id<S>)(S("ok"));
+        }
+    "#,
+        &CheckPolicy::default(),
+    );
+    assert!(program.is_success(), "{program:?}");
+    let values: Vec<_> = program.roots().map(|root| root.value().unwrap()).collect();
+    assert!(matches!(
+        values[0],
+        Value::Nominal {
+            value: PrimitiveValue::Int(7),
+            ..
+        }
+    ));
+    assert!(
+        matches!(values[1], Value::Nominal { value: PrimitiveValue::Str(text), .. } if text == "ok")
+    );
+}
+
+#[test]
+fn generic_functions_move_affine_arguments_once() {
+    let program = run(
+        r"
+        resource R(int);
+        struct Box<T> { item: T; }
+        fn boxed<T>(item: T) -> Box<T> { Box<T> { item = item; } }
+        outputs { single: Box<R> = boxed<R>(R(12)); }
+    ",
+        &CheckPolicy::default(),
+    );
+    assert!(program.is_success(), "{program:?}");
+    assert_eq!(program.roots().next().unwrap().claims().count(), 1);
+}
+
+#[test]
+fn generic_enum_payloads_move_resources_through_exhaustive_matches() {
+    let program = run(
+        r"
+        resource R(int);
+        enum Option<T> { None, Some(T) }
+        enum Result<T, E> { Ok(T), Err(E) }
+        fn unwrap<T>(item: Option<T>, fallback: T) -> T {
+            match item { Some(found) => found, None => fallback }
+        }
+        fn wrap<T>(item: T) -> Result<Option<T>, T> { Result::Ok<Option<T>, T>(Option::Some<T>(item)) }
+        outputs {
+            result: R = match wrap<R>(R(1)) {
+                Ok(maybe) => unwrap<R>(maybe, R(2)),
+                Err(error) => error,
+            };
+            empty: Option<R> = Option::None<R>();
+        }
+    ",
+        &CheckPolicy::default(),
+    );
+    assert!(program.is_success(), "{program:?}");
+    let roots: Vec<_> = program.roots().collect();
+    assert!(matches!(
+        roots[0].value(),
+        Some(Value::Nominal {
+            value: PrimitiveValue::Int(1),
+            resource: true,
+            ..
+        })
+    ));
+    assert_eq!(roots[0].claims().count(), 2);
+    assert!(
+        matches!(roots[1].value(), Some(Value::Variant { index: 0, payload, .. }) if payload.is_empty())
+    );
+}
+
+#[test]
+fn payload_enum_constructors_can_be_specialized_function_values() {
+    let program = run(
+        r"
+        value I(int);
+        enum Pair { Both(I, I) }
+        enum Option<T> { None, Some(T) }
+        fn apply<T, U>(f: fn(T) -> U, item: T) -> U { f(item) }
+        outputs {
+            selected: I = match Pair::Both(I(7), I(9)) { Both(_, right) => right };
+            optional: Option<I> = apply<I, Option<I>>(Option::Some<I>, I(3));
+        }
+    ",
+        &CheckPolicy::default(),
+    );
+    assert!(program.is_success(), "{program:?}");
+    let roots: Vec<_> = program.roots().collect();
+    assert!(matches!(
+        roots[0].value(),
+        Some(Value::Nominal {
+            value: PrimitiveValue::Int(9),
+            ..
+        })
+    ));
+    assert!(
+        matches!(roots[1].value(), Some(Value::Variant { index: 1, payload, .. }) if payload.len() == 1)
+    );
+}
+
+#[test]
+fn enum_payloads_preserve_nested_lists_and_consumable_closures() {
+    let program = run(
+        r"
+        resource R(int);
+        enum Option<T> { None, Some(T) }
+        type Nested<T> = Option<[[T]]>;
+        fn delay<T>(item: T) -> Option<once fn() -> T> {
+            Option::Some<once fn() -> T>(once fn() -> T { item })
+        }
+        outputs {
+            nested: Nested<R> = Option::Some<[[R]]>([[R(1)]]);
+            selected: [R] = match delay<[R]>([R(2)]) {
+                Some(f) => f(), None => []
+            };
+        }
+    ",
+        &CheckPolicy::default(),
+    );
+    assert!(program.is_success(), "{program:?}");
+    let roots: Vec<_> = program.roots().collect();
+    assert_eq!(roots[0].claims().count(), 1);
+    assert_eq!(roots[1].claims().count(), 1);
+    assert!(matches!(roots[1].value(), Some(Value::List { items, .. }) if items.len() == 1));
+}
+
+#[test]
+fn local_inference_composes_functions_enums_and_affine_closures() {
+    let program = run(
+        r"
+        resource R(int);
+        value I(int);
+        enum Option<T> { None, Some(T) }
+        fn id<T>(item: T) -> T { item }
+        fn apply<T, U>(item: T, f: fn(T) -> U) -> U { f(item) }
+        fn defer<T>(item: T) -> once fn() -> T {
+            once fn() -> T { id(item) }
+        }
+        fn make<T>(item: T) -> Option<once fn() -> T> { Option::Some(defer(item)) }
+        outputs {
+            selected: [R] = match make([R(1)]) {
+                Some(f) => apply(f(), id), None => []
+            };
+            empty: Option<[I]> = Option::None();
+            literal: I = id(7);
+        }
+    ",
+        &CheckPolicy::default(),
+    );
+    assert!(program.is_success(), "{program:?}");
+    let roots: Vec<_> = program.roots().collect();
+    assert_eq!(roots[0].claims().count(), 1);
+    assert!(matches!(roots[0].value(), Some(Value::List { items, .. }) if items.len() == 1));
+    assert!(
+        matches!(roots[1].value(), Some(Value::Variant { index: 0, payload, .. }) if payload.is_empty())
+    );
+    assert!(matches!(
+        roots[2].value(),
+        Some(Value::Nominal {
+            value: PrimitiveValue::Int(7),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn recursive_affine_enum_payloads_are_depth_bounded_even_in_fold() {
+    let policy = CheckPolicy::default();
+    let items = vec!["I(0)"; 40].join(",");
+    for constructor in ["Chain::Next(acc)", "Chain::Via(Link::More<Chain>(acc))"] {
+        let source = format!(
+            r"
+            resource R(int); value I(int);
+            enum Link<T> {{ More(T) }}
+            enum Chain {{ End(R), Next(Chain), Via(Link<Chain>) }}
+            outputs {{ out: Chain = fold([{items}], Chain::End(R(1)),
+                fn(acc: Chain, item: I) -> Chain {{ {constructor} }}); }}
+        "
+        );
+        let program = checked(&source, &policy);
+        let result = evaluate_with_limits(
+            &program,
+            &policy,
+            &EvaluationEnvironment::new(&policy),
+            EvaluationLimits {
+                max_depth: 16,
+                ..EvaluationLimits::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            result
+                .roots()
+                .next()
+                .unwrap()
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic
+                    .message
+                    .contains("enum payload value depth limit")),
+            "{result:?}"
+        );
+    }
+}
+
+#[test]
+fn comparisons_evaluate_only_the_selected_branch_with_bytewise_order() {
+    let program = run(
+        r#"
+        value Text(str);
+        resource R(int) where 1..=3;
+        fn selected() -> R { let r = R(1); compare(1, 2, r, r, r) }
+        outputs {
+            less: R = selected();
+            equal: R = compare(Text("a\n"), Text("a\n"), R(9), R(2), R(9));
+            greater: R = compare("é", "z", R(9), R(9), R(3));
+        }
+    "#,
+        &CheckPolicy::default(),
+    );
+    assert!(program.is_success(), "{program:?}");
+    for (name, expected) in [("less", 1), ("equal", 2), ("greater", 3)] {
+        let root = program.roots().find(|root| root.name() == name).unwrap();
+        assert_eq!(root.claims().count(), 1);
+        assert!(
+            matches!(root.value(), Some(Value::Nominal { value: PrimitiveValue::Int(actual), .. }) if *actual == expected)
+        );
+    }
+}
+
+#[test]
+fn comparison_charges_string_bytes_to_the_work_budget() {
+    let policy = CheckPolicy::default();
+    let text = "x".repeat(1024);
+    let program = checked(
+        &format!(
+            r#"value I(int); outputs {{ out: I = compare("{text}", "{text}", I(1), I(2), I(3)); }}"#
+        ),
+        &policy,
+    );
+    let result = evaluate_with_limits(
+        &program,
+        &policy,
+        &EvaluationEnvironment::new(&policy),
+        EvaluationLimits {
+            max_steps_per_root: 512,
+            ..EvaluationLimits::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        result
+            .roots()
+            .next()
+            .unwrap()
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("step limit")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn consumable_closures_capture_and_return_affine_values() {
+    let program = run(
+        r"
+        resource R(int);
+        fn deferred<T>(item: T) -> once fn() -> T { once fn() -> T { item } }
+        fn force(f: once fn() -> R) -> R { f() }
+        fn map<T, U>(items: [T], f: fn(T) -> U) -> [U] {
+            fold(items, [], fn(acc: [U], item: T) -> [U] { acc ++ [f(item)] })
+        }
+        outputs {
+            realized: [R] = map<once fn() -> R, R>([deferred<R>(R(1)), deferred<R>(R(2))], force);
+        }
+    ",
+        &CheckPolicy::default(),
+    );
+    assert!(program.is_success(), "{program:?}");
+    let root = program.roots().next().unwrap();
+    assert_eq!(root.claims().count(), 2);
+    let Value::List { items, .. } = root.value().unwrap() else {
+        panic!("expected forced resources");
+    };
+    assert_eq!(items.len(), 2);
+    assert!(matches!(
+        &items[0],
+        Value::Nominal {
+            value: PrimitiveValue::Int(1),
+            resource: true,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &items[1],
+        Value::Nominal {
+            value: PrimitiveValue::Int(2),
+            resource: true,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn generic_list_map_and_flatten_are_composed_in_the_language() {
+    let program = run(
+        r"
+        resource R(int);
+        struct Box<T> { item: T; }
+        fn boxed<T>(item: T) -> Box<T> { Box<T> { item = item; } }
+        fn map<T, U>(items: [T], transform: fn(T) -> U) -> [U] {
+            fold(items, [], fn(acc: [U], item: T) -> [U] { acc ++ [transform(item)] })
+        }
+        fn flatten<T>(items: [[T]]) -> [T] {
+            fold(items, [], fn(acc: [T], part: [T]) -> [T] { acc ++ part })
+        }
+        outputs {
+            mapped: [Box<R>] = map<R, Box<R>>(flatten<R>([[R(1)], [], [R(2)]]), boxed<R>);
+        }
+    ",
+        &CheckPolicy::default(),
+    );
+    assert!(program.is_success(), "{program:?}");
+    let root = program.roots().next().unwrap();
+    assert_eq!(root.claims().count(), 2);
+    let Value::List { items, .. } = root.value().unwrap() else {
+        panic!("expected mapped list");
+    };
+    assert_eq!(items.len(), 2);
+    for (item, expected) in items.iter().zip([1, 2]) {
+        let Value::Struct { fields, .. } = item else {
+            panic!("expected box");
+        };
+        assert!(
+            matches!(&fields[0].1, Value::Nominal { value: PrimitiveValue::Int(value), resource: true, .. } if *value == expected)
+        );
+    }
+}
+
+#[test]
+fn generic_factory_from_an_import_keeps_its_types_after_return() {
+    let policy = CheckPolicy::default();
+    let mut sources = SourceSet::new();
+    sources
+        .add(
+            "consumer/main.srx",
+            r#"
+        inputs { lib = "path:lib"; }
+        value I(int);
+        fn identity(x: I) -> I { x }
+        outputs { result: [I] = lib::map<I, I>([I(1), I(2)], lib::wrap<I, I>(identity)); }
+    "#,
+        )
+        .unwrap();
+    let lib = sources
+        .create_project_domain(SourceDomainId::project(), "lib")
+        .unwrap();
+    sources
+        .add_to_project_domain(
+            lib,
+            "lib/main.srx",
+            r"
+        pub fn wrap<T, U>(f: fn(T) -> U) -> fn(T) -> U { fn(x: T) -> U { f(x) } }
+        pub fn map<T, U>(items: [T], f: fn(T) -> U) -> [U] {
+            fold(items, [], fn(acc: [U], x: T) -> [U] { acc ++ [f(x)] })
+        }
+    ",
+        )
+        .unwrap();
+    let program = check(resolve(parse_sources(&sources).unwrap()).unwrap(), &policy).unwrap();
+    let result = evaluate(&program, &policy, &EvaluationEnvironment::new(&policy)).unwrap();
+    assert!(result.is_success(), "{result:?}");
+    let Value::List { items, .. } = result.roots().next().unwrap().value().unwrap() else {
+        panic!("expected imported map result");
+    };
+    assert_eq!(items.len(), 2);
+}
+
+#[test]
+fn fold_and_generic_recursion_obey_evaluation_limits() {
+    let policy = CheckPolicy::default();
+    let recursive = run(
+        "value I(int); fn looped<T>(x: T) -> T { looped<T>(x) } outputs { limited: I = looped<I>(I(1)); }",
+        &policy,
+    );
+    assert!(!recursive.is_success());
+    assert!(
+        recursive
+            .roots()
+            .next()
+            .unwrap()
+            .diagnostics()
+            .iter()
+            .any(|error| error.message.contains("depth"))
+    );
+    let items = vec!["I(1)"; 200].join(",");
+    let checked = checked(
+        &format!(
+            "value I(int); fn last(acc: I, item: I) -> I {{ item }} outputs {{ selected: I = fold([{items}], I(0), last); }}"
+        ),
+        &policy,
+    );
+    let limited = evaluate_with_limits(
+        &checked,
+        &policy,
+        &EvaluationEnvironment::new(&policy),
+        EvaluationLimits {
+            max_total_steps: 450,
+            ..EvaluationLimits::default()
+        },
+    );
+    assert!(matches!(
+        limited,
+        Err(EvaluationSetupError::EvaluationWorkLimit)
+    ));
+}
+
+#[test]
+fn function_values_survive_returns_and_struct_fields() {
+    let program = run(
+        "value I(int); type Transform = fn(I) -> I; struct Holder { operation: Transform; } fn id(x: I) -> I { x } fn choose() -> Transform { id } fn apply(holder: Holder, x: I) -> I { let f = holder.operation; f(x) } outputs { result: I = apply(Holder { operation = choose(); }, I(42)); }",
+        &CheckPolicy::default(),
+    );
+    assert!(matches!(
+        program.roots().next().unwrap().value(),
+        Some(Value::Nominal {
+            value: PrimitiveValue::Int(42),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn lists_of_function_types_and_generic_aliases_keep_callable_values() {
+    let program = run(
+        "value I(int); type Helpers<T> = [fn(T) -> T]; fn id(x: I) -> I { x } fn keep(xs: Helpers<I>) -> Helpers<I> { xs } outputs { functions: Helpers<I> = keep([id, id] ++ [id]); }",
+        &CheckPolicy::default(),
+    );
+    let Value::List { items, .. } = program.roots().next().unwrap().value().unwrap() else {
+        panic!("expected a function list");
+    };
+    assert_eq!(items.len(), 3);
+    assert!(
+        items
+            .iter()
+            .all(|value| matches!(value, Value::Function { .. }))
+    );
+}
+
+#[test]
+fn nested_lists_hold_specialized_values_and_keep_their_shape() {
+    let program = run(
+        "value I(int); struct Box<T> { item: T; } outputs { nested: [[Box<I>]] = [[Box<I> { item = I(7); }], []]; }",
+        &CheckPolicy::default(),
+    );
+    let Value::List { items, .. } = program.roots().next().unwrap().value().unwrap() else {
+        panic!("expected an outer list");
+    };
+    assert_eq!(items.len(), 2);
+    assert!(matches!(&items[0], Value::List { items, .. } if items.len() == 1));
+    assert!(matches!(&items[1], Value::List { items, .. } if items.is_empty()));
+}
+
+#[test]
+fn projected_and_returned_functions_are_callable_as_expressions() {
+    let program = run(
+        "value I(int); type Transform = fn(I) -> I; struct Holder { operation: Transform; } fn id(x: I) -> I { x } fn choose() -> Transform { id } outputs { projected: I = Holder { operation = id; }.operation(I(11)); returned: I = choose()(I(12)); grouped: I = (id)(I(13)); }",
+        &CheckPolicy::default(),
+    );
+    let values: Vec<_> = program.roots().map(|root| root.value().unwrap()).collect();
+    assert!(matches!(
+        values.as_slice(),
+        [
+            Value::Nominal {
+                value: PrimitiveValue::Int(11),
+                ..
+            },
+            Value::Nominal {
+                value: PrimitiveValue::Int(12),
+                ..
+            },
+            Value::Nominal {
+                value: PrimitiveValue::Int(13),
+                ..
+            }
+        ]
+    ));
+}
+
+#[test]
+fn closures_capture_immutable_locals_and_survive_the_defining_call() {
+    let result = run(
+        "value I(int); fn factory(a: I) -> fn(I) -> I { fn(x: I) -> I { a } } fn apply(f: fn(I) -> I, x: I) -> I { f(x) } outputs { direct: I = factory(I(7))(I(0)); repeated: I = apply(factory(I(9)), I(0)); }",
+        &CheckPolicy::default(),
+    );
+    let values: Vec<_> = result.roots().map(|root| root.value().unwrap()).collect();
+    assert!(matches!(
+        values.as_slice(),
+        [
+            Value::Nominal {
+                value: PrimitiveValue::Int(7),
+                ..
+            },
+            Value::Nominal {
+                value: PrimitiveValue::Int(9),
+                ..
+            }
+        ]
+    ));
+}
+
+#[test]
+fn closure_without_captures_can_be_called_repeatedly() {
+    let result = run(
+        "value I(int); fn use_it(x: I) -> I { let f = fn(y: I) -> I { y }; let ignored = f(I(1)); f(x) } outputs { out: I = use_it(I(3)); }",
+        &CheckPolicy::default(),
+    );
+    assert!(matches!(
+        result.roots().next().unwrap().value(),
+        Some(Value::Nominal {
+            value: PrimitiveValue::Int(3),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn nested_closure_captures_only_referenced_non_affine_bindings() {
+    let result = run(
+        "value I(int); resource R(int); fn make(x: I, unused: R) -> fn() -> fn() -> I { fn() -> fn() -> I { fn() -> I { x } } } fn use_it() -> I { let outer = make(I(15), R(1)); let inner = outer(); let one = inner(); inner() } outputs { out: I = use_it(); }",
+        &CheckPolicy::default(),
+    );
+    assert!(matches!(
+        result.roots().next().unwrap().value(),
+        Some(Value::Nominal {
+            value: PrimitiveValue::Int(15),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn repeated_imported_output_is_evaluated_once_per_root() {
+    let policy = CheckPolicy::default();
+    let mut sources = SourceSet::new();
+    sources.add("consumer/main.srx", "inputs { dep = \"path:child\"; } struct Pair { a: dep::X; b: dep::X; } outputs { pair: Pair = Pair { a = dep::item; b = dep::item; }; }").unwrap();
+    let child = sources
+        .create_project_domain(SourceDomainId::project(), "dep")
+        .unwrap();
+    let work = "let x = X {}; ".repeat(110);
+    sources.add_to_project_domain(child, "child/main.srx", format!("pub struct X {{}} fn slow() -> X {{ {work} X {{}} }} outputs {{ item: X = slow(); }}")).unwrap();
+    let program = check(resolve(parse_sources(&sources).unwrap()).unwrap(), &policy).unwrap();
+    let result = evaluate_with_limits(
+        &program,
+        &policy,
+        &EvaluationEnvironment::new(&policy),
+        EvaluationLimits {
+            max_steps_per_root: 300,
+            ..EvaluationLimits::default()
+        },
+    )
+    .unwrap();
+    assert!(result.is_success(), "{result:?}");
+}
+
+#[test]
+fn claim_free_imported_output_is_shared_across_selected_roots() {
+    let policy = CheckPolicy::default();
+    let mut sources = SourceSet::new();
+    sources.add("consumer/main.srx", "inputs { dep = \"path:child\"; } outputs { first: dep::X = dep::item; second: dep::X = dep::item; }").unwrap();
+    let child = sources
+        .create_project_domain(SourceDomainId::project(), "dep")
+        .unwrap();
+    let work = "let x = X {}; ".repeat(110);
+    sources.add_to_project_domain(child, "child/main.srx", format!("pub struct X {{}} fn slow() -> X {{ {work} X {{}} }} outputs {{ item: X = slow(); }}")).unwrap();
+    let program = check(resolve(parse_sources(&sources).unwrap()).unwrap(), &policy).unwrap();
+    let result = evaluate_with_limits(
+        &program,
+        &policy,
+        &EvaluationEnvironment::new(&policy),
+        EvaluationLimits {
+            max_total_steps: 300,
+            ..EvaluationLimits::default()
+        },
+    )
+    .unwrap();
+    assert!(result.is_success(), "{result:?}");
+    assert_eq!(result.roots().len(), 2);
+}
+
+#[test]
+fn standard_helper_uses_the_imported_project_callers_asset_origin() {
+    let policy = CheckPolicy::default();
+    let mut sources = SourceSet::new();
+    sources
+        .add(
+            "consumer/main.srx",
+            "inputs { child = \"path:child\"; } struct Pair { external: std::Request; local: std::Request; } outputs { request: Pair = Pair { external = child::make(); local = std::request(std::Url(\"project:assets/local\")); }; }",
+        )
+        .unwrap();
+    let child = sources
+        .create_project_domain(SourceDomainId::project(), "child")
+        .unwrap();
+    sources
+        .add_to_project_domain(
+            child,
+            "child/main.srx",
+            "pub fn make() -> std::Request { std::request(std::Url(\"project:assets/source\")) }",
+        )
+        .unwrap();
+    sources.add_standard_library("std/lib.srx", "mod std { pub value Url(str); pub struct Request { url: Url; } pub fn request(url: Url) -> Request { Request { url = url; } } }").unwrap();
+    let program = check(resolve(parse_sources(&sources).unwrap()).unwrap(), &policy).unwrap();
+    let result = evaluate(&program, &policy, &EvaluationEnvironment::new(&policy)).unwrap();
+    let Value::Struct { fields, .. } = result.roots().next().unwrap().value().unwrap() else {
+        panic!("expected a pair");
+    };
+    let Value::Struct {
+        owner: external, ..
+    } = &fields[0].1
+    else {
+        panic!("expected imported request");
+    };
+    let Value::Struct { owner: local, .. } = &fields[1].1 else {
+        panic!("expected local request");
+    };
+    assert_eq!(*external, Some(child));
+    assert_eq!(*local, Some(SourceDomainId::project()));
+}
+
+#[test]
 fn deterministic_roots_are_independent_and_failures_are_explicit() {
     let result = run(
         "resource Port(int); outputs { bad: [Port] = [Port(80), Port(80)]; good: Port = Port(80); }",
@@ -510,6 +1174,7 @@ fn maximum_supported_value_depth_drops_safely() {
     let mut value = Value::Unit;
     for _ in 0..MAX_EVALUATION_DEPTH {
         value = Value::Struct {
+            owner: None,
             ty: ty.clone(),
             fields: vec![(String::from("next"), value)],
         };

@@ -33,6 +33,7 @@ pub(super) struct PendingItem {
     pub(super) kind: ResolvedItemKind,
     pub(super) span: Span,
     pub(super) variants: Vec<(String, Span)>,
+    pub(super) public: bool,
 }
 
 pub(super) type DomainPath = (SourceDomainId, Vec<String>);
@@ -42,6 +43,7 @@ pub(super) type BoundarySpans = (Option<Span>, Option<Span>);
 pub(super) struct ModuleInfo {
     pub(super) declarations: BTreeMap<String, ItemId>,
     pub(super) children: BTreeMap<String, ModuleId>,
+    pub(super) public_children: BTreeSet<String>,
     pub(super) imports: BTreeMap<String, ItemId>,
     pub(super) exports: BTreeMap<String, ItemId>,
     pub(super) closed: bool,
@@ -63,7 +65,8 @@ pub(super) struct Resolver<'a> {
     pub(super) module_info: Vec<ModuleInfo>,
     pub(super) items: Vec<ResolvedItem>,
     pub(super) item_ids: BTreeMap<DomainPath, ItemId>,
-    pub(super) input_domains: BTreeMap<String, SourceDomainId>,
+    pub(super) input_domains: BTreeMap<SourceDomainId, BTreeMap<String, SourceDomainId>>,
+    pub(super) public_imports: BTreeSet<(ModuleId, String)>,
     pub(super) enum_variants: BTreeMap<ItemId, BTreeMap<String, u32>>,
     pub(super) references: Vec<ResolvedReference>,
     pub(super) locals: Vec<ResolvedLocal>,
@@ -116,6 +119,7 @@ impl<'a> Resolver<'a> {
             items: Vec::new(),
             item_ids: BTreeMap::new(),
             input_domains: BTreeMap::new(),
+            public_imports: BTreeSet::new(),
             enum_variants: BTreeMap::new(),
             references: Vec::new(),
             locals: Vec::new(),
@@ -167,7 +171,7 @@ impl<'a> Resolver<'a> {
                 .items
                 .iter()
                 .rev()
-                .map(|item| (item, Vec::new()))
+                .map(|item| (item, source.module().to_vec()))
                 .collect();
             while let Some((item, module_path)) = stack.pop() {
                 if let ItemKind::Module(module) = &item.kind {

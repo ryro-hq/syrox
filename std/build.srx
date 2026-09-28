@@ -1,0 +1,69 @@
+mod std::pkg {
+    value SourceDirectory(str);
+    value InstalledEntry(str);
+    value BuildTimeout(int);
+    value OutputName(str);
+
+    struct AutotoolsBuild {
+        package: PackageId;
+        source_directory: SourceDirectory;
+        entry: InstalledEntry;
+        timeout_seconds: BuildTimeout;
+    }
+
+    struct GlibcBuild {
+        package: PackageId;
+        source_directory: SourceDirectory;
+        entry: InstalledEntry;
+        timeout_seconds: BuildTimeout;
+    }
+
+    // Generic recipe entry points keep identity, source and build together.
+    struct Recipe<B> {
+        package: Package;
+        acquisition: Acquisition;
+        build: B;
+    }
+
+    // An output is a build input only when the build explicitly selects it.
+    // The engine resolves its retained receipt; the Plan remains pure.
+    struct BuildOutput {
+        package: PackageId;
+        output: OutputName;
+    }
+
+    struct BuildInputs {
+        package: PackageId;
+        selected: [BuildOutput];
+    }
+
+    struct DefaultBuild {
+        package: PackageId;
+    }
+
+    struct RuntimeLoader {
+        package: PackageId;
+    }
+
+    struct RuntimeLibrary {
+        package: PackageId;
+    }
+
+    struct Application {
+        package: PackageId;
+        loader: [RuntimeLoader];
+        libraries: [RuntimeLibrary];
+    }
+
+    struct ApplicationRecipe<B> {
+        package: Package;
+        acquisition: Acquisition;
+        build: B;
+        build_inputs: BuildInputs;
+        application: Application;
+    }
+
+    struct DefaultApplication {
+        package: PackageId;
+    }
+}

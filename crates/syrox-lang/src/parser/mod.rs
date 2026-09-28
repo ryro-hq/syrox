@@ -28,6 +28,10 @@ pub fn parse_sources(sources: &SourceSet) -> Result<ParsedSources, Vec<Diagnosti
                 domain: sources
                     .domain(source_id)
                     .expect("source iteration only yields registered sources"),
+                module: sources
+                    .module(source_id)
+                    .expect("registered module")
+                    .to_vec(),
                 program,
             }),
             Err(source_errors) => {
@@ -46,6 +50,7 @@ pub fn parse_sources(sources: &SourceSet) -> Result<ParsedSources, Vec<Diagnosti
         Ok(ParsedSources {
             sources: parsed,
             input_domains: sources.input_domains().cloned().unwrap_or_default(),
+            project_roots: sources.project_roots().clone(),
         })
     } else {
         errors.sort_by_key(|error| (error.span.source_id(), error.span.start(), error.span.end()));
