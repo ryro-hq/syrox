@@ -397,6 +397,17 @@ impl Plan {
         let root_count = realized.roots().len();
         let mut roots = budget.collection::<PlanRoot>(root_count)?;
         for root in realized.roots() {
+            // A lazy catalog contains memoized factories, not serializable
+            // build outputs. Its selected recipes enter the Plan separately.
+            if root.ty().is_some_and(is_lazy_package_set) {
+                if let Some(Value::Variant { index: 1, .. }) = root.value() {
+                    return Err(PlanError::InvalidRecipe {
+                        root: budget.string(root.name())?,
+                        reason: "duplicate catalog key",
+                    });
+                }
+                continue;
+            }
             budget.node::<PlanRoot>()?;
             let RealizedRootOutcome::Value(value) = root.outcome() else {
                 return Err(PlanError::UnrealizedRoot {
@@ -475,6 +486,21 @@ impl Plan {
         plan.canonical_display_bytes = canonical_display_bytes(&plan, MAX_PLAN_DISPLAY_BYTES)?;
         Ok(plan)
     }
+}
+
+fn is_lazy_package_set(ty: &CanonicalType) -> bool {
+    let specialization = |ty: &CanonicalType, path: &[&str], arity| {
+        matches!(ty, CanonicalType::Specialization { template, arguments }
+            if template.domain() == syrox_lang::SourceDomainId::standard_library()
+                && template.path().iter().map(String::as_str).eq(path.iter().copied())
+                && arguments.len() == arity)
+    };
+    specialization(ty, &["std", "catalog", "PackageSet"], 1)
+        || matches!(ty, CanonicalType::Specialization { template, arguments }
+            if template.domain() == syrox_lang::SourceDomainId::standard_library()
+                && template.path() == ["std", "result", "Result"]
+                && arguments.len() == 2
+                && specialization(&arguments[0], &["std", "catalog", "PackageSet"], 1))
 }
 
 #[derive(Debug)]
@@ -598,7 +624,7 @@ fn extract_packages(
         work.charge()?;
         let value = root.value();
         let mut candidate = decode_package(root.name(), value, &mut edge_count, &mut work, budget)?;
-        if root.identity().path().len() == 1 {
+        if root.identity().path().len() == 1 || root.is_selected() {
             candidate.export = Some(root.name());
         }
         candidates.push(candidate);
@@ -1157,7 +1183,10 @@ fn primitive(
 fn plan_value(value: &Value, budget: &mut ProjectionBudget) -> Result<PlanValue, PlanError> {
     budget.node::<PlanValue>()?;
     Ok(match value {
-        Value::Function { .. } | Value::Closure { .. } | Value::VariantConstructor { .. } => {
+        Value::Function { .. }
+        | Value::Closure { .. }
+        | Value::VariantConstructor { .. }
+        | Value::MemoizedFunction { .. } => {
             return Err(PlanError::FunctionValue);
         }
         Value::Unit => PlanValue::Unit,

@@ -18,11 +18,28 @@ mod std::pkg {
         timeout_seconds: BuildTimeout;
     }
 
+    // A stable, shared recipe result type for mixed local catalogs. Each
+    // variant carries the backend's exact build contract into the Plan.
+    enum Build {
+        Autotools(AutotoolsBuild),
+        Glibc(GlibcBuild),
+    }
+
     // Generic recipe entry points keep identity, source and build together.
     struct Recipe<B> {
         package: Package;
         acquisition: Acquisition;
         build: B;
+    }
+
+    // One result type for catalogs containing libraries, tools and runnable
+    // applications. Absent runtime/build inputs produce no Plan components.
+    struct CatalogRecipe {
+        package: Package;
+        acquisition: Acquisition;
+        build: Build;
+        build_inputs: Option<BuildInputs>;
+        application: Option<Application>;
     }
 
     // An output is a build input only when the build explicitly selects it.

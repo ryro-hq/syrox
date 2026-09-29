@@ -11,6 +11,44 @@ impl Resolver<'_> {
         export: &crate::Ident,
         span: Span,
     ) {
+        if self.cancellation.is_none() {
+            self.resolve_module_exports_inner(requester, namespace, export, span);
+            return;
+        }
+        let diagnostics = self.diagnostics.len();
+        let reference = self.references.len();
+        self.resolve_module_exports_inner(requester, namespace, export, span);
+        let root = self
+            .references
+            .get(reference)
+            .map(|reference| reference.target.clone());
+        let key = (span.source_id().index(), span.start(), span.end());
+        let entries = self.module_exports.remove(&key);
+        self.observe_namespace(
+            requester,
+            namespace,
+            span,
+            super::NamespaceQuery::ModuleExports {
+                export: export.text.clone(),
+            },
+            super::owners::ObservedNamespace::Exports {
+                root: root.as_ref(),
+                entries: entries.as_deref(),
+            },
+            diagnostics,
+        );
+        if let Some(entries) = entries {
+            self.module_exports.insert(key, entries);
+        }
+    }
+
+    fn resolve_module_exports_inner(
+        &mut self,
+        requester: ModuleId,
+        namespace: &Path,
+        export: &crate::Ident,
+        span: Span,
+    ) {
         let target = self.collection_namespace(requester, namespace);
         let Some(ResolvedTarget::Module(root)) = target else {
             self.error("module_exports requires a module namespace", namespace.span);

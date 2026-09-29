@@ -4,8 +4,29 @@ use super::{
 };
 
 impl Resolver<'_> {
-    #[allow(clippy::too_many_lines)]
     pub(super) fn lookup(
+        &mut self,
+        module: ModuleId,
+        path: &Path,
+        expected: Expected,
+    ) -> Option<ResolvedTarget> {
+        let diagnostics = self.diagnostics.len();
+        let result = self.lookup_inner(module, path, expected);
+        self.observe_namespace(
+            module,
+            path,
+            path.span,
+            super::NamespaceQuery::Lookup {
+                expected: expected.description(),
+            },
+            super::owners::ObservedNamespace::Target(result.as_ref()),
+            diagnostics,
+        );
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn lookup_inner(
         &mut self,
         module: ModuleId,
         path: &Path,
@@ -208,7 +229,7 @@ impl Resolver<'_> {
                 ResolvedItemKind::Function
                     | ResolvedItemKind::Resource
                     | ResolvedItemKind::Value
-                    | ResolvedItemKind::OutputFunction
+                    | ResolvedItemKind::OutputValue
             ),
             Expected::Value => matches!(
                 actual,
@@ -216,7 +237,6 @@ impl Resolver<'_> {
                     | ResolvedItemKind::Resource
                     | ResolvedItemKind::OutputValue
                     | ResolvedItemKind::Function
-                    | ResolvedItemKind::OutputFunction
             ),
             Expected::Struct => matches!(actual, ResolvedItemKind::Struct),
         };
@@ -240,6 +260,22 @@ impl Resolver<'_> {
         module: ModuleId,
         path: &Path,
     ) -> Option<(ItemId, u32)> {
+        let diagnostics = self.diagnostics.len();
+        let result = self.lookup_variant_inner(module, path);
+        let target =
+            result.map(|(enumeration, index)| ResolvedTarget::EnumVariant { enumeration, index });
+        self.observe_namespace(
+            module,
+            path,
+            path.span,
+            super::NamespaceQuery::Variant,
+            super::owners::ObservedNamespace::Target(target.as_ref()),
+            diagnostics,
+        );
+        result
+    }
+
+    fn lookup_variant_inner(&mut self, module: ModuleId, path: &Path) -> Option<(ItemId, u32)> {
         for segment in &path.segments {
             if !self.charge(segment.span) {
                 return None;

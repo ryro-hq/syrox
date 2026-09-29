@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
-use crate::{PrimitiveType, SourceSet, check, parse_sources, resolve};
+use crate::{PrimitiveType, SourceSet, Value, check, parse_sources, resolve};
 
 fn checked(source: &str, policy: &CheckPolicy) -> CheckedProgram {
     let mut sources = SourceSet::new();
@@ -96,6 +96,47 @@ fn affine_results_are_borrowed_and_failures_are_not_reexecuted() {
 }
 
 #[test]
+fn function_outputs_accept_expressions_and_aliases_and_are_directly_callable() {
+    let policy = CheckPolicy::default();
+    let environment = EvaluationEnvironment::new(&policy);
+    let program = checked(
+        r"
+        value I(int); type Factory = fn(I) -> I;
+        fn identity<T>(item: T) -> T { item }
+        fn capture(item: I) -> Factory { fn(ignored: I) -> I { item } }
+        outputs {
+            literal: fn(I) -> I = fn(item: I) -> I { item };
+            alias: Factory = literal;
+            generic: fn(I) -> I = identity;
+            captured: fn(I) -> I = capture(I(4));
+            selected: fn(I) -> I = compare(I(1), I(2), literal, alias, generic);
+            results: [I] = [literal(I(1)), alias(I(2)), generic(I(3)), captured(I(0)), selected(I(5))];
+        }
+    ",
+        &policy,
+    );
+    let mut session =
+        EvaluationSession::new(&program, &policy, &environment, EvaluationLimits::default())
+            .unwrap();
+    assert_eq!(session.root_type("literal"), session.root_type("alias"));
+    let root = session.evaluate_root("results").unwrap();
+    let Value::List { items, .. } = root.value().unwrap() else {
+        panic!("expected list");
+    };
+    let numbers: Vec<_> = items
+        .iter()
+        .map(|item| match item {
+            Value::Nominal {
+                value: crate::PrimitiveValue::Int(value),
+                ..
+            } => *value,
+            _ => panic!("expected I"),
+        })
+        .collect();
+    assert_eq!(numbers, [1, 2, 3, 4, 5]);
+}
+
+#[test]
 fn query_budgets_are_operation_wide_and_exhaustion_is_terminal() {
     let policy = CheckPolicy::default();
     let environment = EvaluationEnvironment::new(&policy);
@@ -135,6 +176,39 @@ fn query_budgets_are_operation_wide_and_exhaustion_is_terminal() {
         );
         assert!(matches!(session.into_realized(), Err(error) if error == expected));
     }
+}
+
+#[test]
+fn retained_consumer_index_shares_the_evaluation_budget() {
+    let policy = CheckPolicy::default();
+    let environment = EvaluationEnvironment::new(&policy);
+    let program = checked("value I(int); outputs { a: I = I(1); }", &policy);
+    let mut measured =
+        EvaluationSession::new(&program, &policy, &environment, EvaluationLimits::default())
+            .unwrap();
+    measured.evaluate_root("a").unwrap();
+    let mut session = EvaluationSession::new(
+        &program,
+        &policy,
+        &environment,
+        EvaluationLimits {
+            max_retained_expansion_bytes: measured.retained_expansion + 1,
+            ..EvaluationLimits::default()
+        },
+    )
+    .unwrap();
+    session.evaluate_root("a").unwrap();
+    session.reserve_metadata_bytes(1).unwrap();
+    assert_eq!(
+        session.reserve_metadata_bytes(1),
+        Err(EvaluationSetupError::EvaluationRetainedExpansionLimit)
+    );
+    assert!(matches!(
+        session.evaluate_root("a"),
+        Err(EvaluationQueryError::Setup(
+            EvaluationSetupError::EvaluationRetainedExpansionLimit
+        ))
+    ));
 }
 
 #[test]

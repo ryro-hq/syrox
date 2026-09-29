@@ -82,6 +82,98 @@ pub struct CheckedExpression {
     pub(super) span: Span,
     pub(super) ty: Ty,
     pub(super) elaboration: Option<Elaboration>,
+    pub(super) expected: Option<Ty>,
+    pub(super) status: TypeStatus,
+}
+
+/// Confidence in an editor fact, independent of the contextual expected type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeStatus {
+    Known,
+    Unknown,
+    Invalid,
+}
+
+impl Ty {
+    pub fn is_known(&self) -> bool {
+        match self {
+            Self::Error => false,
+            Self::List(inner) => inner.is_known(),
+            Self::Specialization { arguments, .. } => arguments.iter().all(Self::is_known),
+            Self::Function {
+                parameters, result, ..
+            } => parameters.iter().all(Self::is_known) && result.is_known(),
+            _ => true,
+        }
+    }
+}
+
+/// Snapshot-local binding facts. No evaluation or resource claims are performed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckedLocal {
+    pub id: LocalId,
+    pub declaration: Span,
+    pub ty: Ty,
+    pub affine: bool,
+    pub annotated: bool,
+    pub status: TypeStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnershipUseKind {
+    Consume,
+    Capture,
+    Reuse,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnershipUse {
+    pub local: LocalId,
+    pub span: Span,
+    pub kind: OwnershipUseKind,
+    pub affine: bool,
+    pub status: OwnershipUseStatus,
+    pub previous_move: Option<Span>,
+    pub conditional: bool,
+    /// Closure expression for capture events; the reference span remains exact.
+    pub closure: Option<Span>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnershipUseStatus {
+    Valid,
+    Invalid,
+    Unknown,
+}
+
+impl OwnershipUse {
+    pub const fn is_valid(&self) -> bool {
+        matches!(self.status, OwnershipUseStatus::Valid)
+    }
+    /// A recovered syntax fragment prevents a precise availability conclusion.
+    pub const fn is_uncertain(&self) -> bool {
+        matches!(self.status, OwnershipUseStatus::Unknown)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParameterHint {
+    pub argument: Span,
+    pub parameter: Span,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EditorFacts {
+    pub locals: BTreeMap<LocalId, CheckedLocal>,
+    pub uses: Vec<OwnershipUse>,
+    pub patterns: Vec<CheckedPattern>,
+    pub shapes: BTreeMap<ItemId, super::NominalShape>,
+    pub outputs: BTreeMap<ItemId, Ty>,
+    pub fields: Vec<(Span, Span, Ty)>,
+    pub units: usize,
+    pub arguments: Vec<ParameterHint>,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +198,12 @@ impl CheckedPattern {
 }
 
 impl CheckedExpression {
+    pub const fn type_status(&self) -> TypeStatus {
+        self.status
+    }
+    pub fn expected_type(&self) -> Option<&Ty> {
+        self.expected.as_ref()
+    }
     pub const fn span(&self) -> Span {
         self.span
     }

@@ -1,6 +1,5 @@
 mod std::pkg {
     value PackageId(str);
-    value CatalogInput(str);
     value SourceUrl(str);
     value SourceDigest(str);
     value SourceLimit(int);
@@ -12,11 +11,6 @@ mod std::pkg {
     struct Package {
         id: PackageId;
         dependencies: [Dependency];
-    }
-
-    // Opt-in to publishing typed factories from one locked recipe input.
-    struct Catalog {
-        input: CatalogInput;
     }
 
     struct SourceRequest {

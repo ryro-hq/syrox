@@ -1,12 +1,25 @@
 use super::types::{nominal_enum, nominal_head, raw_from_ty};
 use super::{
-    BTreeMap, BTreeSet, Binding, Block, CheckedExpression, CheckedPattern, Checker, Context,
-    Elaboration, Expression, ExpressionKind, Item, ItemId, ItemKind, MatchArm, ModuleId,
-    OutputKind, ParsedSource, Path, Pattern, Primitive, ResolvedTarget, Span, StatementKind,
-    StringLiteral, StringPart, StructField, StructInfo, Ty, Type,
+    BTreeMap, BTreeSet, Block, CheckedExpression, CheckedPattern, Checker, Context, Elaboration,
+    Expression, ExpressionKind, Item, ItemKind, MatchArm, ModuleId, OutputKind, ParsedSource, Path,
+    Pattern, Primitive, ResolvedTarget, Span, StatementKind, StringLiteral, StringPart,
+    StructField, StructInfo, Ty, Type,
 };
 
 impl Checker<'_> {
+    fn check_memoize(&mut self, value: &Expression, expected: Option<&Ty>, context: Context) -> Ty {
+        let ty = self.check_expr(value, expected, context, true);
+        if matches!(&ty, Ty::Function { parameters, once: false, .. } if parameters.is_empty()) {
+            ty
+        } else {
+            self.error(
+                "memoize requires a reusable function with no arguments",
+                value.span,
+            );
+            Ty::Error
+        }
+    }
+
     pub(super) fn check_defaults(&mut self) {
         let structures: Vec<_> = self
             .structs
@@ -20,19 +33,22 @@ impl Checker<'_> {
                 .copied()
                 .map(|parameter| (parameter, Ty::Parameter(parameter)))
                 .collect();
-            self.type_parameters = args.clone();
+            self.body.type_parameters = args.clone();
             for field in &info.declaration.fields {
                 if !self.charge(field.span) {
                     return;
                 }
                 if let Some(default) = &field.default {
-                    self.bindings.clear();
-                    let want = self.resolve_type(&field.ty, &args, 0);
-                    let got = self.check_expr(default, Some(&want), info.context, true);
-                    self.expect_same(&want, &got, default.span, "struct field default");
+                    self.with_body(default.span, |checker| {
+                        checker.body.bindings.clear();
+                        checker.body.type_parameters = args.clone();
+                        let want = checker.resolve_type(&field.ty, &args, 0);
+                        let got = checker.check_expr(default, Some(&want), info.context, true);
+                        checker.expect_same(&want, &got, default.span, "struct field default");
+                    });
                 }
             }
-            self.type_parameters.clear();
+            self.body.type_parameters.clear();
             let _ = id;
         }
     }
@@ -44,28 +60,28 @@ impl Checker<'_> {
             .map(|(&id, info)| (id, *info))
             .collect();
         for (id, info) in functions {
-            self.bindings.clear();
-            self.type_parameters = self.function_parameters(id);
-            let Some((parameter_types, result)) = self.function_types.get(&id).cloned() else {
-                continue;
-            };
-            for (parameter, ty) in info.declaration.parameters.iter().zip(parameter_types) {
-                if let Some(local) = self.local_id(parameter.name.span) {
-                    let affine = self.affine(&ty, parameter.name.span);
-                    self.bindings.insert(
-                        local,
-                        Binding {
-                            affine,
-                            ty,
-                            moved: None,
-                            declaration: parameter.name.span,
-                        },
-                    );
+            self.with_body(info.declaration.name.span, |checker| {
+                checker.body.bindings.clear();
+                checker.body.type_parameters = checker.function_parameters(id);
+                let Some((parameter_types, result)) = checker.function_types.get(&id).cloned()
+                else {
+                    return;
+                };
+                for (parameter, ty) in info.declaration.parameters.iter().zip(parameter_types) {
+                    if let Some(local) = checker.local_id(parameter.name.span) {
+                        checker.bind_local(local, ty, parameter.name.span, true);
+                    }
                 }
-            }
-            let got = self.check_block(&info.declaration.body, Some(&result), info.context);
-            self.expect_same(&result, &got, info.declaration.body.span, "function return");
-            self.type_parameters.clear();
+                if checker
+                    .incomplete_bodies
+                    .contains(&super::span_key(info.declaration.name.span))
+                {
+                    return;
+                }
+                let got = checker.check_block(&info.declaration.body, Some(&result), info.context);
+                checker.expect_same(&result, &got, info.declaration.body.span, "function return");
+                checker.body.type_parameters.clear();
+            });
         }
     }
 
@@ -80,19 +96,45 @@ impl Checker<'_> {
                 return Ty::Error;
             }
             match &statement.kind {
-                StatementKind::Let { name, value } => {
-                    let ty = self.check_expr(value, None, context, true);
+                StatementKind::Recovery { binding } => {
+                    self.recover_bindings(binding.as_ref(), statement.span);
+                }
+                StatementKind::Let {
+                    name,
+                    ty: annotation,
+                    value,
+                } => {
+                    let before = self.body.fact_errors;
+                    let before_unknown = self.body.fact_unknowns;
+                    let expected = annotation
+                        .as_ref()
+                        .map(|ty| self.resolve_type(ty, &self.body.type_parameters.clone(), 0));
+                    let actual = self.check_expr(value, expected.as_ref(), context, true);
+                    if let Some(want) = &expected {
+                        self.expect_same(want, &actual, value.span, "let binding");
+                    }
+                    let ty = expected.unwrap_or(actual);
                     if let Some(local) = self.local_id(name.span) {
-                        let affine = self.affine(&ty, name.span);
-                        self.bindings.insert(
-                            local,
-                            Binding {
-                                affine,
-                                ty,
-                                moved: None,
-                                declaration: name.span,
-                            },
-                        );
+                        self.bind_local(local, ty, name.span, annotation.is_some());
+                        if before != self.body.fact_errors {
+                            self.body
+                                .bindings
+                                .get_mut(&local)
+                                .expect("bound local")
+                                .status = super::TypeStatus::Invalid;
+                            if let Some(fact) = self.editor.locals.get_mut(&local) {
+                                fact.status = super::TypeStatus::Invalid;
+                            }
+                        } else if before_unknown != self.body.fact_unknowns {
+                            self.body
+                                .bindings
+                                .get_mut(&local)
+                                .expect("bound local")
+                                .status = super::TypeStatus::Unknown;
+                            if let Some(fact) = self.editor.locals.get_mut(&local) {
+                                fact.status = super::TypeStatus::Unknown;
+                            }
+                        }
                     }
                 }
                 StatementKind::Expression(expression) => {
@@ -100,9 +142,15 @@ impl Checker<'_> {
                 }
             }
         }
-        block.tail.as_ref().map_or(Ty::Unit, |tail| {
+        let result = block.tail.as_ref().map_or(Ty::Unit, |tail| {
             self.check_expr(tail, expected, context, true)
-        })
+        });
+        if block.incomplete {
+            self.body.fact_unknowns = self.body.fact_unknowns.saturating_add(1);
+            Ty::Error
+        } else {
+            result
+        }
     }
 
     pub(super) fn check_outputs(&mut self) {
@@ -158,43 +206,23 @@ impl Checker<'_> {
                         return;
                     }
                     match &output.kind {
-                        OutputKind::Value { ty, value, .. } => {
-                            self.bindings.clear();
-                            let want = self.resolve_type(ty, &BTreeMap::new(), 0);
-                            let got = self.check_expr(value, Some(&want), context, true);
-                            self.expect_same(&want, &got, value.span, "output value");
+                        OutputKind::Value { name, ty, value } => {
+                            self.with_body(output.span, |checker| {
+                                checker.body.bindings.clear();
+                                let want = checker.resolve_type(ty, &BTreeMap::new(), 0);
+                                if let Some(id) =
+                                    checker.item_at.get(&super::span_key(output.span)).copied()
+                                    && checker.reserve_editor_metadata(name.span)
+                                    && let Some(ty) = checker.retain_editor_type(&want)
+                                {
+                                    checker.editor.outputs.insert(id, ty);
+                                }
+                                let got = checker.check_expr(value, Some(&want), context, true);
+                                checker.expect_same(&want, &got, value.span, "output value");
+                            });
                         }
                         OutputKind::Type { ty, .. } => {
                             self.check_type_output(ty);
-                        }
-                        OutputKind::Function {
-                            signature,
-                            function,
-                            ..
-                        } => {
-                            let Some(ResolvedTarget::Item(target)) = self.target(function.span)
-                            else {
-                                continue;
-                            };
-                            let target = *target;
-                            let Some((parameters, result)) =
-                                self.function_types.get(&target).cloned()
-                            else {
-                                continue;
-                            };
-                            let wanted: Vec<_> = signature
-                                .parameters
-                                .iter()
-                                .map(|ty| self.resolve_type(ty, &BTreeMap::new(), 0))
-                                .collect();
-                            let wanted_result =
-                                self.resolve_type(&signature.result, &BTreeMap::new(), 0);
-                            if parameters != wanted || result != wanted_result {
-                                self.error(
-                                    "exported function signature does not exactly match",
-                                    output.span,
-                                );
-                            }
                         }
                     }
                 }
@@ -242,6 +270,8 @@ impl Checker<'_> {
             return Ty::Error;
         }
         let mut elaboration = None;
+        let before = self.body.fact_errors;
+        let before_unknown = self.body.fact_unknowns;
         let ty = match &expression.kind {
             ExpressionKind::Integer(_) => self.lift_literal(Ty::Int, expected, &mut elaboration),
             ExpressionKind::String(string) => {
@@ -261,6 +291,7 @@ impl Checker<'_> {
             ExpressionKind::ModuleExports { mapper, .. } => {
                 self.check_module_exports(mapper, context, expression.span, &mut elaboration)
             }
+            ExpressionKind::Memoize(value) => self.check_memoize(value, expected, context),
             ExpressionKind::Compare {
                 left,
                 right,
@@ -294,7 +325,8 @@ impl Checker<'_> {
                 path,
                 type_arguments,
                 fields,
-            } => self.check_struct_literal(path, type_arguments, fields, context),
+                recovery,
+            } => self.check_struct_literal(path, type_arguments, fields, recovery, context),
             ExpressionKind::List(items) => {
                 self.check_list(items, expected, context, expression.span)
             }
@@ -314,7 +346,7 @@ impl Checker<'_> {
             ExpressionKind::Field { value, fields } => {
                 let mut ty = self.check_expr(value, None, context, true);
                 for field in fields {
-                    ty = self.project(&ty, &field.text, field.span);
+                    ty = self.project(&ty, &field.text, context, field.span);
                 }
                 ty
             }
@@ -325,9 +357,21 @@ impl Checker<'_> {
                 span: expression.span,
                 ty: ty.clone(),
                 elaboration,
+                expected: expected.cloned(),
+                status: self.fact_status(&ty, before, before_unknown),
             });
         }
         ty
+    }
+
+    fn fact_status(&self, ty: &Ty, errors: u64, unknowns: u64) -> super::TypeStatus {
+        if errors != self.body.fact_errors {
+            super::TypeStatus::Invalid
+        } else if unknowns == self.body.fact_unknowns && ty.is_known() {
+            super::TypeStatus::Known
+        } else {
+            super::TypeStatus::Unknown
+        }
     }
 
     fn check_concat(
@@ -361,8 +405,10 @@ impl Checker<'_> {
         context: Context,
         span: Span,
     ) -> Ty {
-        let mut outer = self.bindings.clone();
+        let mut outer = self.body.bindings.clone();
         let mut captures = BTreeSet::new();
+        let mut recorded = BTreeSet::new();
+        self.observe_reference_scan(span);
         for reference in self.program.references() {
             if !self.charge(reference.span()) {
                 break;
@@ -375,44 +421,57 @@ impl Checker<'_> {
                 continue;
             }
             if let ResolvedTarget::Local(local) = reference.target()
-                && outer.get(local).is_some_and(|binding| binding.affine)
+                && let Some(binding) = outer.get(local)
             {
+                if recorded.insert(*local) {
+                    self.record_use(
+                        *local,
+                        location,
+                        super::OwnershipUseKind::Capture,
+                        Some(span),
+                        once || !binding.affine,
+                    );
+                }
+                if !binding.affine {
+                    continue;
+                }
                 if !once {
                     self.error("closure cannot capture an affine value", location);
                 } else if captures.insert(*local) {
-                    self.use_local(*local, location, true);
+                    self.capture_local(*local, location);
                     outer.get_mut(local).expect("outer capture").moved = Some(location);
                 }
             }
         }
         for local in captures {
-            self.bindings
+            self.body
+                .bindings
                 .get_mut(&local)
                 .expect("capture binding")
                 .moved = None;
         }
         let arguments: Vec<_> = parameters
             .iter()
-            .map(|parameter| self.resolve_type(&parameter.ty, &self.type_parameters.clone(), 0))
+            .map(|parameter| {
+                self.resolve_type(&parameter.ty, &self.body.type_parameters.clone(), 0)
+            })
             .collect();
-        let return_type = self.resolve_type(result, &self.type_parameters.clone(), 0);
+        let return_type = self.resolve_type(result, &self.body.type_parameters.clone(), 0);
         for (parameter, ty) in parameters.iter().zip(&arguments) {
             if let Some(local) = self.local_id(parameter.name.span) {
-                let affine = self.affine(ty, parameter.span);
-                self.bindings.insert(
-                    local,
-                    Binding {
-                        affine,
-                        ty: ty.clone(),
-                        moved: None,
-                        declaration: parameter.span,
-                    },
-                );
+                self.bind_local(local, ty.clone(), parameter.name.span, true);
             }
         }
         let got = self.check_block(body, Some(&return_type), context);
         self.expect_same(&return_type, &got, body.span, "closure return");
-        self.bindings = outer;
+        if body.incomplete {
+            for binding in outer.values_mut() {
+                if binding.affine {
+                    binding.ownership_unknown = true;
+                }
+            }
+        }
+        self.body.bindings = outer;
         Ty::Function {
             parameters: arguments,
             result: Box::new(return_type),
@@ -542,7 +601,20 @@ impl Checker<'_> {
             }
             return Ty::Error;
         };
+        if self.output_values.contains_key(&item) {
+            let ty = self.check_path_value(callee, None, true, &mut None);
+            if let Ty::Function {
+                parameters, result, ..
+            } = ty
+            {
+                self.check_arguments(arguments, &parameters, context, callee.span);
+                return *result;
+            }
+            self.error("callee is not a function value", callee.span);
+            return Ty::Error;
+        }
         if let Some((parameters, result)) = self.function_types.get(&item).cloned() {
+            self.record_arguments(item, arguments);
             if !self.function_parameters(item).is_empty() {
                 let (result, substitutions) = self.infer_call(
                     item,
@@ -602,26 +674,33 @@ impl Checker<'_> {
         path: &Path,
         type_arguments: &[Type],
         fields: &[StructField],
+        recovery: &[Span],
         context: Context,
     ) -> Ty {
         let Some(ResolvedTarget::Item(item)) = self.target(path.span).cloned() else {
             return Ty::Error;
         };
         let raw_parameters: BTreeMap<_, _> = self
+            .body
             .type_parameters
             .iter()
             .map(|(&parameter, ty)| (parameter, raw_from_ty(ty.clone())))
             .collect();
         let raw = self.expand_item_type(item, type_arguments, &raw_parameters, 0, path.span);
         let ty = self
-            .concretize(raw, &self.type_parameters.clone(), path.span)
+            .concretize(raw, &self.body.type_parameters.clone(), path.span)
             .unwrap_or(Ty::Error);
         self.validate_concrete_type(&ty, path.span);
         self.track_generic_instances(&ty, path.span);
         let Some(info) = self.structs.get(&item).cloned() else {
             return Ty::Error;
         };
-        self.check_opaque_authority(item, &ty, &info, context, path.span);
+        if !self.has_representation_authority(&ty, &info, context) {
+            self.error(
+                "opaque struct constructor is private in this source domain",
+                path.span,
+            );
+        }
         let canonical = self.item_identity(item);
         if self
             .policy
@@ -650,7 +729,14 @@ impl Checker<'_> {
             })
             .collect();
         let mut seen = BTreeSet::new();
+        let mut gaps = recovery.iter().peekable();
         for field in fields {
+            while gaps
+                .peek()
+                .is_some_and(|gap| gap.start() < field.span.start())
+            {
+                self.recover_bindings(None, *gaps.next().expect("recovery gap"));
+            }
             if !seen.insert(field.name.text.clone()) {
                 self.error(
                     format!("field `{}` is given twice", field.name.text),
@@ -658,6 +744,7 @@ impl Checker<'_> {
                 );
             }
             if let Some((declaration, want)) = declared.get(&field.name.text) {
+                self.record_field(field.name.span, declaration.name.span, want);
                 let got = self.check_expr(&field.value, Some(want), context, true);
                 self.expect_same(want, &got, field.value.span, "struct field");
                 let _ = declaration;
@@ -669,50 +756,34 @@ impl Checker<'_> {
                 );
             }
         }
+        for gap in gaps {
+            self.recover_bindings(None, *gap);
+        }
         for (name, (field, _)) in declared {
-            if field.default.is_none() && !seen.contains(&name) {
+            if recovery.is_empty() && field.default.is_none() && !seen.contains(&name) {
                 self.error(format!("missing field `{name}`"), path.span);
             }
         }
         ty
     }
 
-    pub(super) fn check_opaque_authority(
-        &mut self,
-        item: ItemId,
+    pub(super) fn has_representation_authority(
+        &self,
         ty: &Ty,
         info: &StructInfo<'_>,
         context: Context,
-        span: Span,
-    ) {
-        if !info.declaration.opaque {
-            return;
+    ) -> bool {
+        super::RepresentationAuthority {
+            domain: info.context.domain,
+            module: info.context.module,
+            opaque: info.declaration.opaque,
+            owner_parameter: info
+                .declaration
+                .type_parameters
+                .iter()
+                .position(|parameter| parameter.owner),
         }
-        let lexical = context.domain == info.context.domain
-            && self.module_is_descendant(context.module, info.context.module);
-        let delegated = info
-            .declaration
-            .type_parameters
-            .iter()
-            .position(|parameter| parameter.owner)
-            .and_then(|index| match ty {
-                Ty::Specialization { arguments, .. } => arguments.get(index),
-                _ => None,
-            })
-            .and_then(nominal_head)
-            .and_then(|owner| self.item_context.get(&owner).copied())
-            .is_some_and(|owner| {
-                owner.domain == info.context.domain
-                    && context.domain == owner.domain
-                    && self.module_is_descendant(context.module, owner.module)
-            });
-        if !lexical && !delegated {
-            self.error(
-                "opaque struct constructor is private in this source domain",
-                span,
-            );
-        }
-        let _ = item;
+        .permits(self.program, ty, context.module)
     }
 
     pub(super) fn check_list(
@@ -834,17 +905,17 @@ impl Checker<'_> {
         }
         let mut covered = BTreeSet::new();
         let mut wildcard = false;
-        let baseline = self.bindings.clone();
+        let baseline = self.body.bindings.clone();
         let mut merged = baseline.clone();
         let mut result = expected.cloned();
-        for arm in arms {
+        for (arm_index, arm) in arms.iter().enumerate() {
             if !self.charge(arm.span) {
                 return Ty::Error;
             }
             if wildcard {
                 self.error("match arm is unreachable after wildcard", arm.span);
             }
-            self.bindings = baseline.clone();
+            self.body.bindings = baseline.clone();
             match &arm.pattern {
                 Pattern::Wildcard(_) => wildcard = true,
                 Pattern::Path(path) | Pattern::Variant { path, .. } => {
@@ -887,16 +958,9 @@ impl Checker<'_> {
             } else {
                 result = Some(got);
             }
-            for (local, binding) in &self.bindings {
-                if binding.moved.is_some()
-                    && let Some(joined) = merged.get_mut(local)
-                    && joined.moved.is_none()
-                {
-                    joined.moved = binding.moved;
-                }
-            }
+            self.join_branch(&mut merged, arm_index == 0);
         }
-        self.bindings = merged;
+        self.body.bindings = merged;
         if !wildcard {
             let count = self
                 .enums
@@ -909,7 +973,7 @@ impl Checker<'_> {
         result.unwrap_or(Ty::Error)
     }
 
-    pub(super) fn check_string(&mut self, string: &StringLiteral, _context: Context) {
+    pub(super) fn check_string(&mut self, string: &StringLiteral, context: Context) {
         for part in &string.parts {
             let StringPart::Interpolation { path, .. } = part else {
                 continue;
@@ -919,7 +983,7 @@ impl Checker<'_> {
             };
             let mut ty = self.use_local(local, path.span, true);
             for field in path.segments.iter().skip(1) {
-                ty = self.project(&ty, &field.text, field.span);
+                ty = self.project(&ty, &field.text, context, field.span);
             }
             let wrapper = match ty {
                 Ty::Nominal(item) => self.primitives.contains_key(&item),

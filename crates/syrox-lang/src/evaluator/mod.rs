@@ -20,6 +20,7 @@ pub use model::{
     RealizedProgram, RealizedRoot, RealizedRootOutcome, ResourceClaim, ResourceClaimKey, Value,
 };
 
+pub use runtime::MemoId;
 pub use session::{EvaluationQueryError, EvaluationSession};
 
 pub fn evaluate(

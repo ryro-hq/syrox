@@ -147,24 +147,98 @@ pub fn resolve_build(
 ) -> Result<ResolvedBuild, RealizeError> {
     let (project, export, pin) = reference_parts(reference, user)?;
     let project = std::path::absolute(project)?;
+    #[cfg(target_os = "linux")]
+    if let Some(key) = export {
+        let plan = plan_for_export(&project, key, pin, checks)?;
+        return resolved_export(project, key, plan);
+    }
+    #[cfg(not(target_os = "linux"))]
+    if let Some(key) = export {
+        let plan = plan_project_with(&project, checks)?;
+        if pin.is_some_and(|pin| pin.as_bytes() != plan.lock_digest()) {
+            return Err(RealizeError::CatalogDrift);
+        }
+        return resolved_export(project, key, plan);
+    }
+    #[cfg(target_os = "linux")]
+    let plan = {
+        let locked = crate::project::open_locked_project_with(&project, checks)?;
+        if pin.is_some_and(|pin| pin.as_bytes() != locked.lock_digest()) {
+            return Err(RealizeError::CatalogDrift);
+        }
+        let mut evaluation = locked.evaluation()?;
+        if let Some(id) = evaluation.default_package_id("default_build", "DefaultBuild")? {
+            if evaluation.select_package(&id)? {
+                Ok(evaluation.into_selected_plan()?)
+            } else {
+                plan_project_with(&project, checks).map_err(RealizeError::from)
+            }
+        } else {
+            plan_project_with(&project, checks).map_err(RealizeError::from)
+        }?
+    };
+    #[cfg(not(target_os = "linux"))]
     let plan = plan_project_with(&project, checks)?;
     if pin.is_some_and(|pin| pin.as_bytes() != plan.lock_digest()) {
         return Err(RealizeError::CatalogDrift);
     }
-    let package = if let Some(export) = export {
-        plan.packages()
-            .find(|package| package.export() == Some(export))
-            .ok_or_else(|| RealizeError::MissingExport(export.to_owned()))?
-    } else {
-        let id = plan.default_build().ok_or(RealizeError::MissingDefault)?;
-        plan.packages()
-            .find(|package| package.id() == id)
-            .expect("validated default package")
-    };
-    let export = package
-        .export()
-        .expect("selected root package export")
-        .to_owned();
+    let id = plan.default_build().ok_or(RealizeError::MissingDefault)?;
+    let package = plan
+        .packages()
+        .find(|package| package.id() == id)
+        .expect("validated default package");
+    finish_resolved_build(
+        project,
+        package
+            .export()
+            .expect("selected root package export")
+            .to_owned(),
+        plan,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn plan_for_export(
+    project: &Path,
+    key: &str,
+    pin: Option<ContentDigest>,
+    checks: &CheckConfiguration,
+) -> Result<Plan, RealizeError> {
+    let locked = crate::project::open_locked_project_with(project, checks)?;
+    if pin.is_some_and(|pin| pin.as_bytes() != locked.lock_digest()) {
+        return Err(RealizeError::CatalogDrift);
+    }
+    let mut evaluation = locked.evaluation()?;
+    match evaluation.select_package(key) {
+        Ok(true) => Ok(evaluation.into_selected_plan()?),
+        Err(ProjectOperationError::MissingPackageReference { .. }) => {
+            Err(RealizeError::MissingExport(key.to_owned()))
+        }
+        Err(error) => Err(error.into()),
+        Ok(false) => {
+            evaluation.evaluate_all()?;
+            Ok(evaluation.into_plan()?)
+        }
+    }
+}
+
+fn resolved_export(
+    project: PathBuf,
+    export: &str,
+    plan: Plan,
+) -> Result<ResolvedBuild, RealizeError> {
+    finish_resolved_build(project, export.to_owned(), plan)
+}
+
+fn finish_resolved_build(
+    project: PathBuf,
+    export: String,
+    plan: Plan,
+) -> Result<ResolvedBuild, RealizeError> {
+    let package = plan
+        .packages()
+        .find(|package| package.export() == Some(&export))
+        .ok_or_else(|| RealizeError::MissingExport(export.clone()))?;
     let build = plan
         .builds()
         .find(|build| build.package() == package.id())
@@ -184,19 +258,6 @@ pub fn resolve_build(
         plan: Arc::new(plan),
         build,
     })
-}
-
-/// Enumerate public buildable exports of one locked project or pinned catalog.
-/// Like `resolve_build`, this is pure with respect to Store and build host.
-pub fn build_exports(
-    reference: &str,
-    user: &UserConfiguration,
-    checks: &CheckConfiguration,
-) -> Result<Vec<String>, RealizeError> {
-    Ok(resolve_builds(reference, user, checks)?
-        .into_iter()
-        .map(|build| build.export)
-        .collect())
 }
 
 /// Resolve all public builds from one verified project snapshot. In particular,
@@ -249,12 +310,53 @@ pub fn search_build_exports(
     user: &UserConfiguration,
     checks: &CheckConfiguration,
 ) -> Result<Vec<String>, RealizeError> {
-    if query.len() > 255 || !query.is_ascii() {
-        return Err(RealizeError::InvalidReference);
-    }
+    validate_search_query(query)?;
     let catalog = user.catalog().ok_or(RealizeError::MissingCatalog)?;
-    let plan = plan_project_with(catalog.path(), checks)?;
-    if catalog.lock_digest().as_bytes() != plan.lock_digest() {
+    search_project_exports(
+        query,
+        catalog.path(),
+        Some(catalog.lock_digest().as_bytes()),
+        checks,
+    )
+}
+
+/// Search a local project verified against its Lock, without a configured catalog.
+pub fn search_project_build_exports(
+    query: &str,
+    path: &Path,
+    checks: &CheckConfiguration,
+) -> Result<Vec<String>, RealizeError> {
+    search_project_exports(query, path, None, checks)
+}
+
+fn search_project_exports(
+    query: &str,
+    path: &Path,
+    expected_lock: Option<&[u8; 32]>,
+    checks: &CheckConfiguration,
+) -> Result<Vec<String>, RealizeError> {
+    validate_search_query(query)?;
+    #[cfg(target_os = "linux")]
+    let plan = {
+        let locked = crate::project::open_locked_project_with(path, checks)?;
+        if expected_lock.is_some_and(|expected| expected != locked.lock_digest()) {
+            return Err(RealizeError::CatalogDrift);
+        }
+        let mut evaluation = locked.evaluation()?;
+        if let Some(names) = evaluation.package_names("packages")? {
+            let query = query.to_ascii_lowercase();
+            return Ok(names
+                .into_iter()
+                .filter(|name| name.to_ascii_lowercase().contains(&query))
+                .collect());
+        }
+        evaluation.evaluate_all()?;
+        evaluation.into_plan()?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let plan = plan_project_with(path, checks)?;
+    #[cfg(not(target_os = "linux"))]
+    if expected_lock.is_some_and(|expected| expected != plan.lock_digest()) {
         return Err(RealizeError::CatalogDrift);
     }
     let query = query.to_ascii_lowercase();
@@ -270,6 +372,13 @@ pub fn search_build_exports(
         .collect::<Vec<_>>();
     names.sort();
     Ok(names)
+}
+
+fn validate_search_query(query: &str) -> Result<(), RealizeError> {
+    if query.len() > 255 || !query.is_ascii() {
+        return Err(RealizeError::InvalidReference);
+    }
+    Ok(())
 }
 
 type ReferenceParts<'a> = (&'a Path, Option<&'a str>, Option<ContentDigest>);
@@ -300,33 +409,45 @@ fn reference_parts<'a>(
 fn is_project_path(text: &str) -> bool {
     matches!(text, "." | "..") || text.contains('/')
 }
+// A module export key is a sequence of public identifiers, not one flat name.
+// Keep the existing ASCII/length policy until the public Unicode CLI contract
+// is settled; never accept empty segments or a single ':' as separators.
 fn valid_export(text: &str) -> bool {
     !text.is_empty()
         && text.len() <= 255
-        && text
-            .bytes()
-            .enumerate()
-            .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()))
+        && text.split("::").all(|segment| {
+            !segment.is_empty()
+                && segment.bytes().enumerate().all(|(i, b)| {
+                    b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit())
+                })
+        })
 }
 
-/// Realize the already selected recipe. One operation lease spans source cache
-/// lookup, acquisition and build publication; managed result roots are immutable
-/// and content-addressed by receipt, not a caller-invented GC name.
-pub fn realize_build(
-    resolved: &ResolvedBuild,
-    user: &UserConfiguration,
-    worker: &Path,
-    offline: bool,
-    progress: impl FnMut(BuildProgress),
-) -> Result<BuildResult, RealizeError> {
-    realize_build_with_cancellation(
-        resolved,
-        user,
-        worker,
-        offline,
-        &BuildCancellation::default(),
-        progress,
-    )
+#[cfg(test)]
+mod reference_tests {
+    use super::valid_export;
+
+    #[test]
+    fn composite_catalog_keys_follow_module_export_spelling() {
+        for valid in ["hello", "group::hello", "a0::b_2::C"] {
+            assert!(valid_export(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "::hello",
+            "group::",
+            "group:::hello",
+            "group:hello",
+            "a::::b",
+            "a/b",
+            "a#b",
+            "a::1b",
+            "a::ü",
+        ] {
+            assert!(!valid_export(invalid), "{invalid}");
+        }
+        assert!(!valid_export(&format!("a::{}", "b".repeat(253))));
+    }
 }
 
 /// Cancellable realization. Source transport observes cancellation during its

@@ -1,6 +1,4 @@
-use super::{
-    BTreeMap, Binding, Checker, Elaboration, ItemId, LocalId, Pattern, RawTy, Span, Ty, Type,
-};
+use super::{BTreeMap, Checker, Elaboration, ItemId, LocalId, Pattern, RawTy, Span, Ty, Type};
 
 impl Checker<'_> {
     pub(super) fn bind_variant_pattern(
@@ -20,16 +18,7 @@ impl Checker<'_> {
         }
         for (binding, ty) in bindings.iter().zip(payload) {
             if let Some(local) = self.local_id(binding.span) {
-                let affine = self.affine(&ty, binding.span);
-                self.bindings.insert(
-                    local,
-                    Binding {
-                        ty,
-                        affine,
-                        moved: None,
-                        declaration: binding.span,
-                    },
-                );
+                self.bind_local(local, ty, binding.span, false);
             }
         }
     }
@@ -101,13 +90,14 @@ impl Checker<'_> {
         elaboration: &mut Option<Elaboration>,
     ) -> Ty {
         let params = self
+            .body
             .type_parameters
             .iter()
             .map(|(&id, ty)| (id, super::types::raw_from_ty(ty.clone())))
             .collect();
         let raw = self.expand_item_type(enumeration, arguments, &params, 0, span);
         let ty = self
-            .concretize(raw, &self.type_parameters.clone(), span)
+            .concretize(raw, &self.body.type_parameters.clone(), span)
             .unwrap_or(Ty::Error);
         self.validate_concrete_type(&ty, span);
         self.track_generic_instances(&ty, span);

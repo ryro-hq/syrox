@@ -226,6 +226,18 @@ fn compact_cli_selects_project_file_searches_pinned_catalog_and_checks_dry_run()
     let file = fixture.project.join("main.srx");
     let file = file.to_str().unwrap();
     let direct = success(fixture.run(&["info", ".#friendly"]));
+    assert_eq!(
+        success(fixture.run(&["info", "-f", file, "--search", "friend"])).trim(),
+        "friendly"
+    );
+    assert_eq!(
+        success(fixture.run(&["info", ".", "--search", "friend"])).trim(),
+        "friendly"
+    );
+    failure(
+        fixture.run(&["info", ".#friendly", "--search", "friend"]),
+        "requires a project path",
+    );
     let selected = success(fixture.run(&["info", "-f", file, ".#friendly"]));
     assert_eq!(direct, selected);
     assert_eq!(
@@ -261,9 +273,86 @@ fn compact_cli_selects_project_file_searches_pinned_catalog_and_checks_dry_run()
     );
     failure(
         fixture.run(&["info", "hello", "--search", "friend"]),
-        "omit REF",
+        "requires a project path",
     );
     assert!(!fixture.store.exists());
+}
+
+#[test]
+fn search_lists_locked_functional_package_set_without_evaluating_recipes() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.project.join("recipes/group")).unwrap();
+    fs::write(
+        fixture.project.join("recipes/group/hello.srx"),
+        "pub fn recipe() -> std::Package { std::Package { id = \"hello\"; dependencies = []; } }",
+    )
+    .unwrap();
+    fs::write(
+        fixture.project.join("recipes/unused.srx"),
+        "pub fn recipe() -> std::Package { recipe() }",
+    )
+    .unwrap();
+    fs::write(
+        fixture.project.join("main.srx"),
+        r#"
+        inputs { recipes = "modules:recipes"; }
+        outputs {
+            packages: std::Result<std::PackageSet<std::Package>, std::MapKey> =
+                std::package_set(module_exports(
+                    recipes, recipe, std::MapEntry::Entry<fn() -> std::Package>
+                ));
+        }
+        "#,
+    )
+    .unwrap();
+    success(fixture.run(&["project", "lock", "."]));
+    let file = fixture.project.join("main.srx");
+    assert_eq!(
+        success(fixture.run(&["info", "-f", file.to_str().unwrap(), "--search", "group"])).trim(),
+        "group::hello"
+    );
+    assert_eq!(
+        success(fixture.run(&["info", ".", "--search", "unused"])).trim(),
+        "unused"
+    );
+    assert_eq!(
+        success(fixture.run(&[
+            "info",
+            fixture.project.to_str().unwrap(),
+            "--search",
+            "group",
+        ]))
+        .trim(),
+        "group::hello"
+    );
+    let digest = ContentDigest::sha256(&fs::read(fixture.project.join("Syrox.lock")).unwrap());
+    fs::write(
+        &fixture.config,
+        format!(
+            "[catalog]\npath = '{}'\nlock-sha256 = '{digest}'\n",
+            fixture.project.display()
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        success(fixture.run(&["info", "--search", "group"])).trim(),
+        "group::hello"
+    );
+    assert_eq!(
+        success(fixture.run(&["info", "--search", "unused"])).trim(),
+        "unused"
+    );
+    assert!(!fixture.store.exists());
+    fs::write(
+        fixture.project.join("recipes/new.srx"),
+        "pub fn recipe() -> std::Package { std::Package { id = \"new\"; dependencies = []; } }",
+    )
+    .unwrap();
+    failure(fixture.run(&["info", "--search", "new"]), "drift");
+    failure(
+        fixture.run(&["info", "-f", file.to_str().unwrap(), "--search", "new"]),
+        "lock",
+    );
 }
 
 #[test]
@@ -301,7 +390,42 @@ fn explicit_recipe_export_selected_from_imported_package_set_works_in_cli() {
         "pub fn recipe() -> std::Recipe<std::AutotoolsBuild> { recipe() }",
     )
     .unwrap();
+    fs::create_dir_all(catalog.join("recipes/group")).unwrap();
+    fs::copy(
+        catalog.join("recipes/hello.srx"),
+        catalog.join("recipes/group/hello.srx"),
+    )
+    .unwrap();
     success(fixture.run(&["project", "lock", catalog.to_str().unwrap()]));
+    let selected = format!("{}#hello", catalog.display());
+    let direct = success(fixture.run(&["info", &selected]));
+    assert!(direct.contains("internal-hello"), "{direct}");
+    assert!(
+        success(fixture.run(&["build", "-n", &selected])).contains("would build internal-hello")
+    );
+    let catalog_lock = ContentDigest::sha256(&fs::read(catalog.join("Syrox.lock")).unwrap());
+    fs::write(
+        &fixture.config,
+        format!(
+            "[catalog]\npath = '{}'\nlock-sha256 = '{catalog_lock}'\n",
+            catalog.display()
+        ),
+    )
+    .unwrap();
+    assert_eq!(success(fixture.run(&["info", "hello"])), direct);
+    assert!(
+        success(fixture.run(&["build", "-n", "group::hello"]))
+            .contains("would build internal-hello")
+    );
+    failure(
+        fixture.run(&["run", "group::hello"]),
+        "no declared application",
+    );
+    failure(fixture.run(&["info", "unused"]), "evaluation failed");
+    failure(
+        fixture.run(&["info", "missing"]),
+        "no public buildable package export",
+    );
     fs::write(
         fixture.project.join("main.srx"),
         r#"

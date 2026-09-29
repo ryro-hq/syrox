@@ -1,0 +1,36 @@
+mod std::recipe {
+    // Generative, lazy instance identity. Copying or reexporting a reference
+    // preserves the memoized function; constructing another reference does not.
+    opaque struct RecipeRef<R> {
+        factory: fn() -> R;
+    }
+
+    opaque struct OutputRef<R> {
+        recipe: RecipeRef<R>;
+        output: OutputName;
+    }
+
+    pub fn recipe_ref<R>(factory: fn() -> R) -> RecipeRef<R> {
+        RecipeRef<R> { factory = memoize(factory); }
+    }
+
+    pub fn recipe_factory<R>(recipe: RecipeRef<R>) -> fn() -> R {
+        recipe.factory
+    }
+
+    pub fn recipe_value<R>(recipe: RecipeRef<R>) -> R {
+        recipe.factory()
+    }
+
+    pub fn recipe_output<R>(recipe: RecipeRef<R>, name: OutputName) -> OutputRef<R> {
+        OutputRef<R> { recipe = recipe; output = name; }
+    }
+
+    pub fn output_recipe<R>(output: OutputRef<R>) -> RecipeRef<R> {
+        output.recipe
+    }
+
+    pub fn output_name<R>(output: OutputRef<R>) -> OutputName {
+        output.output
+    }
+}

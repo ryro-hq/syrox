@@ -231,16 +231,20 @@ fn invalid_empty_and_string_forms_are_rejected() {
 }
 
 #[test]
-fn failed_item_restores_depth_and_cursor_before_recovery() {
+fn failed_item_restores_depth_and_recovery_preserves_consumed_syntax() {
     let source = Source::new("recovery.srx", "inputs { broken } type Good = T;").unwrap();
-    let tokens = lex(SourceId::SINGLE, &source).unwrap();
+    let tokens: Vec<_> = lex(SourceId::SINGLE, &source)
+        .tokens
+        .into_iter()
+        .filter(|token| !token.kind.is_trivia())
+        .collect();
     let mut parser = Parser::new(SourceId::SINGLE, &source, &tokens);
 
     assert!(parser.parse_item().is_none());
     assert_eq!(parser.depth, 0);
-    assert_eq!(parser.at, 0);
+    assert!(parser.at > 0);
 
-    parser.recover_item(false);
+    parser.recover_item(0, false);
     let item = parser
         .parse_item()
         .expect("recovery should reach the type alias");

@@ -20,6 +20,9 @@ impl Component<'_> {
     pub(super) fn identity(&self) -> &CanonicalItemIdentity {
         self.root.identity()
     }
+    pub(super) fn is_selected(&self) -> bool {
+        self.root.is_selected()
+    }
     pub(super) const fn ty(&self) -> &CanonicalType {
         self.ty
     }
@@ -49,23 +52,36 @@ pub(super) fn components<'a>(
     Ok(result)
 }
 
-fn recipe_kind(ty: &CanonicalType) -> Option<bool> {
-    let CanonicalType::Specialization {
-        template,
-        arguments,
-    } = ty
-    else {
-        return None;
-    };
-    if template.domain() != syrox_lang::SourceDomainId::standard_library() || arguments.len() != 1 {
-        return None;
-    }
-    match template.path() {
-        [std, pkg, name] if std == "std" && pkg == "pkg" => match name.as_str() {
-            "Recipe" => Some(false),
-            "ApplicationRecipe" => Some(true),
-            _ => None,
-        },
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecipeKind {
+    Basic,
+    Application,
+    Catalog,
+}
+
+fn recipe_kind(ty: &CanonicalType) -> Option<RecipeKind> {
+    match ty {
+        CanonicalType::Specialization {
+            template,
+            arguments,
+        } if template.domain() == syrox_lang::SourceDomainId::standard_library()
+            && arguments.len() == 1 =>
+        {
+            match template.path() {
+                [std, pkg, name] if std == "std" && pkg == "pkg" => match name.as_str() {
+                    "Recipe" => Some(RecipeKind::Basic),
+                    "ApplicationRecipe" => Some(RecipeKind::Application),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        CanonicalType::Nominal(identity)
+            if identity.domain() == syrox_lang::SourceDomainId::standard_library()
+                && identity.path() == ["std", "pkg", "CatalogRecipe"] =>
+        {
+            Some(RecipeKind::Catalog)
+        }
         _ => None,
     }
 }
@@ -85,7 +101,10 @@ fn recipe_components<'a>(
     let Value::Struct { fields, .. } = value else {
         return Err(invalid("expected a recipe struct"));
     };
-    let names: &[&str] = if recipe_kind(ty) == Some(true) {
+    let kind = recipe_kind(ty);
+    let names: &[&str] = if kind == Some(RecipeKind::Basic) {
+        &["package", "acquisition", "build"]
+    } else {
         &[
             "package",
             "acquisition",
@@ -93,8 +112,6 @@ fn recipe_components<'a>(
             "build_inputs",
             "application",
         ]
-    } else {
-        &["package", "acquisition", "build"]
     };
     if fields.len() != names.len()
         || !fields
@@ -117,6 +134,28 @@ fn recipe_components<'a>(
         .ok_or_else(|| invalid("recipe package has no PackageId"))?;
     for (index, (field, value)) in fields.iter().enumerate() {
         budget.charge_work()?;
+        let value = if kind == Some(RecipeKind::Catalog) && index >= 3 {
+            let contract = if index == 3 {
+                "BuildInputs"
+            } else {
+                "Application"
+            };
+            match unwrap_optional(value, contract) {
+                OptionalComponent::Present(value) => value,
+                OptionalComponent::Absent => continue,
+                OptionalComponent::Invalid => {
+                    return Err(invalid("invalid optional recipe component"));
+                }
+            }
+        } else {
+            value
+        };
+        let value = if index == 2 {
+            unwrap_build(value)
+                .ok_or_else(|| invalid("recipe build has no supported build contract"))?
+        } else {
+            value
+        };
         let Value::Struct { ty, fields, .. } = value else {
             return Err(invalid("recipe component must be a contract struct"));
         };
@@ -143,6 +182,55 @@ fn recipe_components<'a>(
         push(result, Component { root, ty, value }, budget)?;
     }
     Ok(())
+}
+
+enum OptionalComponent<'a> {
+    Invalid,
+    Absent,
+    Present(&'a Value),
+}
+
+fn unwrap_optional<'a>(value: &'a Value, contract: &str) -> OptionalComponent<'a> {
+    let Value::Variant { ty, index, payload } = value else {
+        return OptionalComponent::Invalid;
+    };
+    let CanonicalType::Specialization {
+        template,
+        arguments,
+    } = ty.as_ref()
+    else {
+        return OptionalComponent::Invalid;
+    };
+    if template.domain() != syrox_lang::SourceDomainId::standard_library()
+        || template.path() != ["std", "option", "Option"]
+        || arguments.len() != 1
+        || !exact_nominal(&arguments[0], &["std", "pkg", contract])
+    {
+        return OptionalComponent::Invalid;
+    }
+    match (*index, payload.as_slice()) {
+        (0, []) => OptionalComponent::Absent,
+        (1, [value]) => OptionalComponent::Present(value),
+        _ => OptionalComponent::Invalid,
+    }
+}
+
+fn unwrap_build(value: &Value) -> Option<&Value> {
+    let Value::Variant { ty, index, payload } = value else {
+        return Some(value);
+    };
+    if !exact_nominal(ty, &["std", "pkg", "Build"]) {
+        return None;
+    }
+    let [build @ Value::Struct { ty: backend, .. }] = payload.as_slice() else {
+        return None;
+    };
+    let path = match index {
+        0 => &["std", "pkg", "AutotoolsBuild"][..],
+        1 => &["std", "pkg", "GlibcBuild"][..],
+        _ => return None,
+    };
+    exact_nominal(backend, path).then_some(build)
 }
 
 fn push<'a>(

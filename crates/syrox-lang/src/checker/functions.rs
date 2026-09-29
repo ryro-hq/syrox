@@ -27,32 +27,25 @@ impl Checker<'_> {
                 left.span,
             );
         }
-        let baseline = self.bindings.clone();
+        let baseline = self.body.bindings.clone();
         let mut merged = baseline.clone();
         let mut result = expected.cloned();
-        for branch in branches {
+        for (index, branch) in branches.iter().enumerate() {
             for _ in baseline.values() {
                 if !self.charge(branch.span) {
                     return Ty::Error;
                 }
             }
-            self.bindings = baseline.clone();
+            self.body.bindings = baseline.clone();
             let actual = self.check_expr(branch, result.as_ref(), context, true);
             if let Some(expected) = &result {
                 self.expect_same(expected, &actual, branch.span, "comparison branch");
             } else {
                 result = Some(actual);
             }
-            for (id, binding) in &self.bindings {
-                if binding.moved.is_some()
-                    && let Some(joined) = merged.get_mut(id)
-                    && joined.moved.is_none()
-                {
-                    joined.moved = binding.moved;
-                }
-            }
+            self.join_branch(&mut merged, index == 0);
         }
-        self.bindings = merged;
+        self.body.bindings = merged;
         result.unwrap_or(Ty::Error)
     }
 
@@ -112,15 +105,15 @@ impl Checker<'_> {
             );
             return Ty::Error;
         }
-        let outer = self.type_parameters.clone();
+        let outer = self.body.type_parameters.clone();
         let mut substitutions = BTreeMap::new();
         let mut instance = Vec::with_capacity(arguments.len());
         for (parameter, argument) in parameters.iter().zip(arguments) {
             let ty = self.resolve_type(argument, &outer, 0);
             instance.push(ty.clone());
-            let local = self
-                .local_id(parameter.name.span)
-                .expect("resolved type parameter");
+            let Some(local) = self.local_id(parameter.name.span) else {
+                return Ty::Error;
+            };
             substitutions.insert(local, ty);
         }
         self.track_generic_instances(

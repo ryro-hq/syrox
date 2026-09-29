@@ -22,6 +22,40 @@ fn identity(path: &str) -> CanonicalItemIdentity {
 }
 
 #[test]
+fn annotated_lets_contextualize_literals_lists_and_generics_once() {
+    let result = run(
+        "value I(int); fn id<T>(x: T) -> T { x } fn materialize() -> I { let empty: [I] = []; let concrete: I = id(7); concrete } outputs { answer: I = materialize(); }",
+        &CheckPolicy::default(),
+    );
+    assert!(matches!(
+        result.roots().next().unwrap().value().unwrap(),
+        Value::Nominal {
+            value: PrimitiveValue::Int(7),
+            ..
+        }
+    ));
+    let mut sources = SourceSet::new();
+    sources
+        .add(
+            "main.srx",
+            "resource R(int); fn duplicate(r: R) { let first: R = r; let second: R = r; }",
+        )
+        .unwrap();
+    let errors = check(
+        resolve(parse_sources(&sources).unwrap()).unwrap(),
+        &CheckPolicy::default(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| error.code == crate::DiagnosticCode::MovedValue)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn functions_pass_as_values_and_locals_call_through_typed_parameters() {
     let program = run(
         "value I(int); fn id(x: I) -> I { x } fn apply(f: fn(I) -> I, x: I) -> I { f(x) } fn indirect(x: I) -> I { let f = id; f(x) } outputs { first: I = apply(id, I(7)); second: I = indirect(I(9)); }",

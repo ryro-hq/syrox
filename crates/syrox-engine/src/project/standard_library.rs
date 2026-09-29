@@ -12,6 +12,7 @@ impl AuthenticatedStandardLibrary {
             ),
             ("std/option.srx", include_str!("../../../../std/option.srx")),
             ("std/result.srx", include_str!("../../../../std/result.srx")),
+            ("std/recipe.srx", include_str!("../../../../std/recipe.srx")),
             (
                 "std/collections/list.srx",
                 include_str!("../../../../std/collections/list.srx"),

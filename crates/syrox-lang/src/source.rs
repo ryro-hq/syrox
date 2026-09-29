@@ -38,7 +38,7 @@ impl SourceId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Span {
     pub(crate) source: SourceId,
     pub(crate) start: u32,
@@ -124,6 +124,17 @@ impl Default for SourceSet {
 }
 
 impl SourceSet {
+    pub(crate) fn replace_text(&mut self, id: SourceId, text: &str) -> Result<(), SourceError> {
+        let old = &self.sources[id.index()];
+        let source = Source::new(old.name(), text)?;
+        self.total_bytes = self
+            .total_bytes
+            .checked_sub(old.text().len())
+            .and_then(|bytes| bytes.checked_add(text.len()))
+            .ok_or(SourceError::SourceSetTooLarge)?;
+        self.sources[id.index()] = source;
+        Ok(())
+    }
     pub fn new() -> Self {
         Self {
             sources: Vec::new(),
@@ -349,6 +360,15 @@ impl SourceSet {
             .project_roots
             .contains(&domain)
             .then_some(domain)
+    }
+
+    /// Domain bound to an input alias, including file/module inputs.
+    pub fn input_domain(&self, parent: SourceDomainId, alias: &str) -> Option<SourceDomainId> {
+        self.input_domains
+            .as_ref()?
+            .get(&parent)?
+            .get(alias)
+            .copied()
     }
 
     pub(crate) fn module(&self, id: SourceId) -> Option<&[String]> {

@@ -272,7 +272,7 @@ fn authenticated_project_input_alias_resolves_only_root_outputs() {
         .add_to_input_domain(
             catalog,
             "catalog.srx",
-            "value Result(str); fn make() -> Result { \"ok\" } fn hidden() {} outputs { make: fn() -> Result = make; }",
+            "value Result(str); fn make_inner() -> Result { \"ok\" } fn hidden() {} outputs { make: fn() -> Result = make_inner; }",
         )
         .unwrap();
 
@@ -295,7 +295,7 @@ fn authenticated_project_input_alias_resolves_only_root_outputs() {
         .add_to_input_domain(
             catalog,
             "catalog.srx",
-            "value Result(str); fn make() -> Result { \"ok\" } outputs { make: fn() -> Result = make; }",
+            "value Result(str); fn make_inner() -> Result { \"ok\" } outputs { make: fn() -> Result = make_inner; }",
         )
         .unwrap();
     let program = resolve(parse_sources(&sources).unwrap()).unwrap();
@@ -323,7 +323,7 @@ fn loader_binding_without_a_matching_inputs_declaration_is_not_visible() {
         .add_to_input_domain(
             catalog,
             "catalog.srx",
-            "value Result(str); fn make() -> Result { \"ok\" } outputs { make: fn() -> Result = make; }",
+            "value Result(str); fn make_inner() -> Result { \"ok\" } outputs { make: fn() -> Result = make_inner; }",
         )
         .unwrap();
 
@@ -349,7 +349,7 @@ fn input_domains_cannot_use_project_input_aliases() {
         .add_to_input_domain(
             catalog,
             "catalog.srx",
-            "value Result(str); fn make() -> Result { \"ok\" } outputs { make: fn() -> Result = make; }",
+            "value Result(str); fn make_inner() -> Result { \"ok\" } outputs { make: fn() -> Result = make_inner; }",
         )
         .unwrap();
     let sibling = sources.create_input_domain("sibling").unwrap();
@@ -459,7 +459,16 @@ fn local_id_overflow_is_a_diagnostic_not_aliasing() {
     let mut resolver = Resolver::new(&parsed);
     resolver.next_local = u32::MAX;
 
-    assert_eq!(resolver.local(Span::new(SourceId::SINGLE, 0, 0)), None);
+    assert_eq!(
+        resolver.local(
+            &crate::Ident {
+                text: "x".into(),
+                span: Span::new(SourceId::SINGLE, 0, 0)
+            },
+            LocalKind::Binding
+        ),
+        None
+    );
     assert_eq!(
         resolver.diagnostics[0].message,
         "too many local declarations"

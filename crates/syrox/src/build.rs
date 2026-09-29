@@ -5,6 +5,7 @@ use syrox_engine::{
     BuildCancellation, BuildError, BuildExecution, BuildProgress, CheckConfiguration, RealizeError,
     ResolvedBuild, UserConfiguration, realize_build_with_cancellation,
     realize_builds_with_cancellation, resolve_build, resolve_builds, search_build_exports,
+    search_project_build_exports,
 };
 
 #[derive(Debug, clap::Args)]
@@ -17,7 +18,7 @@ pub(super) struct ReferenceArguments {
     /// Explicit user configuration instead of `$XDG_CONFIG_HOME/syrox/config.toml`.
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Find matching exports in the pinned local catalog (info only).
+    /// Find matching packages in the pinned catalog or a selected local project (info only).
     #[arg(long)]
     search: Option<String>,
 }
@@ -260,10 +261,17 @@ pub(super) fn info(args: &ReferenceArguments, checks: &CheckConfiguration) -> Ex
     render((|| {
         let user = UserConfiguration::load(args.config.as_deref()).map_err(|e| e.to_string())?;
         if let Some(query) = &args.search {
-            if args.reference.is_some() || args.file.is_some() {
-                return Err("--search selects the pinned catalog; omit REF and -f".to_owned());
+            let names = if args.reference.is_some() || args.file.is_some() {
+                let reference =
+                    super::reference::select(args.reference.as_deref(), args.file.as_deref())?;
+                if reference.contains('#') || !(reference == "." || reference.contains('/')) {
+                    return Err("--search requires a project path or -f main.srx".to_owned());
+                }
+                search_project_build_exports(query, std::path::Path::new(&reference), checks)
+            } else {
+                search_build_exports(query, &user, checks)
             }
-            let names = search_build_exports(query, &user, checks).map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?;
             return Ok(if names.is_empty() {
                 "no matching packages".into()
             } else {

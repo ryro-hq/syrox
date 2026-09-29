@@ -5,7 +5,7 @@ use super::{
 };
 
 impl Resolver<'_> {
-    fn resolve_enum(&mut self, module: ModuleId, enumeration: &crate::Enum) {
+    fn resolve_enum(&mut self, module: ModuleId, enumeration: &crate::Enum, scope: crate::Span) {
         let mut types = BTreeMap::new();
         for parameter in &enumeration.type_parameters {
             if !self.charge(parameter.span) {
@@ -18,10 +18,11 @@ impl Resolver<'_> {
                 self.error("duplicate type parameter", parameter.span);
                 continue;
             }
-            let Some(id) = self.local(parameter.name.span) else {
+            let Some(id) = self.local(&parameter.name, crate::LocalKind::TypeParameter) else {
                 return;
             };
             types.insert(parameter.name.text.clone(), id);
+            self.editor_local(&parameter.name, id, scope);
         }
         for variant in &enumeration.variants {
             for ty in &variant.payload {
@@ -71,145 +72,169 @@ impl Resolver<'_> {
                 if !names.insert(&binding.text) {
                     self.error("duplicate pattern binding", binding.span);
                 }
-                let Some(id) = self.local(binding.span) else {
+                let Some(id) = self.local(binding, crate::LocalKind::Pattern) else {
                     return;
                 };
                 values.insert(binding.text.clone(), id);
+                self.editor_local(binding, id, arm.value.span);
             }
         }
         self.resolve_expression(module, &arm.value, &values, types);
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(super) fn resolve_contents(&mut self) {
         for located in self.walk_items() {
             if !self.charge(located.item.span) {
                 return;
             }
             let module = self.module_ids[&(located.domain, located.module_path.clone())];
-            match &located.item.kind {
-                ItemKind::Module(_) | ItemKind::Use(_) => {}
-                ItemKind::Enum(enumeration) => self.resolve_enum(module, enumeration),
-                ItemKind::Inputs(inputs) => {
-                    for input in &inputs.entries {
-                        self.resolve_string(&input.value, &BTreeMap::new());
+            if let Some((name, _, _)) = super::namespace::declaration(located.item) {
+                self.with_owner(
+                    module,
+                    name,
+                    super::ResolutionOwnerPart::Declaration,
+                    located.item.span,
+                    |resolver| resolver.resolve_item_contents(module, &located),
+                );
+            } else {
+                self.resolve_item_contents(module, &located);
+            }
+            if self.exhausted {
+                return;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn resolve_item_contents(&mut self, module: ModuleId, located: &super::LocatedItem<'_>) {
+        match &located.item.kind {
+            ItemKind::Module(_) | ItemKind::Use(_) => {}
+            ItemKind::Enum(enumeration) => {
+                self.resolve_enum(module, enumeration, located.item.span);
+            }
+            ItemKind::Inputs(inputs) => {
+                for input in &inputs.entries {
+                    self.resolve_string(&input.value, &BTreeMap::new());
+                }
+            }
+            ItemKind::TypeAlias(alias) => {
+                let mut type_locals = BTreeMap::new();
+                for parameter in &alias.type_parameters {
+                    if !self.charge(parameter.span) {
+                        return;
+                    }
+                    if parameter.owner {
+                        self.error("`owner` is only valid on an opaque struct", parameter.span);
+                    }
+                    if type_locals.contains_key(&parameter.name.text) {
+                        self.error("duplicate type parameter", parameter.span);
+                        continue;
+                    }
+                    let Some(id) = self.local(&parameter.name, crate::LocalKind::TypeParameter)
+                    else {
+                        return;
+                    };
+                    type_locals.insert(parameter.name.text.clone(), id);
+                    self.editor_local(&parameter.name, id, located.item.span);
+                }
+                self.resolve_type(module, &alias.ty, &type_locals);
+            }
+            ItemKind::Struct(structure) => {
+                let mut type_locals = BTreeMap::new();
+                for parameter in &structure.type_parameters {
+                    if !self.charge(parameter.span) {
+                        return;
+                    }
+                    if type_locals.contains_key(&parameter.name.text) {
+                        self.error("duplicate type parameter", parameter.span);
+                        continue;
+                    }
+                    let Some(id) = self.local(&parameter.name, crate::LocalKind::TypeParameter)
+                    else {
+                        return;
+                    };
+                    type_locals.insert(parameter.name.text.clone(), id);
+                    self.editor_local(&parameter.name, id, located.item.span);
+                }
+                for field in &structure.fields {
+                    self.resolve_type(module, &field.ty, &type_locals);
+                    if let Some(default) = &field.default {
+                        self.with_owner(
+                            module,
+                            &structure.name.text,
+                            super::ResolutionOwnerPart::FieldDefault(field.name.text.clone()),
+                            default.span,
+                            |resolver| {
+                                resolver.resolve_expression(
+                                    module,
+                                    default,
+                                    &BTreeMap::new(),
+                                    &type_locals,
+                                );
+                            },
+                        );
                     }
                 }
-                ItemKind::TypeAlias(alias) => {
-                    let mut type_locals = BTreeMap::new();
-                    for parameter in &alias.type_parameters {
-                        if !self.charge(parameter.span) {
-                            return;
-                        }
-                        if parameter.owner {
-                            self.error("`owner` is only valid on an opaque struct", parameter.span);
-                        }
-                        if type_locals.contains_key(&parameter.name.text) {
-                            self.error("duplicate type parameter", parameter.span);
-                            continue;
-                        }
-                        let Some(id) = self.local(parameter.name.span) else {
-                            return;
-                        };
-                        type_locals.insert(parameter.name.text.clone(), id);
+            }
+            ItemKind::Resource(declaration) | ItemKind::Value(declaration) => {
+                for refinement in &declaration.refinements {
+                    if !self.charge(refinement.span) {
+                        return;
                     }
-                    self.resolve_type(module, &alias.ty, &type_locals);
+                    match &refinement.kind {
+                        // Predicate names are resolved by the caller's
+                        // closed checking policy, not by source lookup.
+                        RefinementKind::Predicate(path) => {
+                            for segment in &path.segments {
+                                if !self.charge(segment.span) {
+                                    return;
+                                }
+                            }
+                        }
+                        RefinementKind::Set(values) => {
+                            for value in values {
+                                let span = match value {
+                                    Literal::Integer(integer) => integer.span,
+                                    Literal::String(string) => string.span,
+                                };
+                                if !self.charge(span) {
+                                    return;
+                                }
+                                if let Literal::String(string) = value {
+                                    self.resolve_string(string, &BTreeMap::new());
+                                }
+                            }
+                        }
+                        RefinementKind::Range { .. } => {}
+                    }
                 }
-                ItemKind::Struct(structure) => {
-                    let mut type_locals = BTreeMap::new();
-                    for parameter in &structure.type_parameters {
-                        if !self.charge(parameter.span) {
-                            return;
-                        }
-                        if type_locals.contains_key(&parameter.name.text) {
-                            self.error("duplicate type parameter", parameter.span);
-                            continue;
-                        }
-                        let Some(id) = self.local(parameter.name.span) else {
-                            return;
-                        };
-                        type_locals.insert(parameter.name.text.clone(), id);
+            }
+            ItemKind::Function(function) => self.resolve_function(module, function),
+            ItemKind::Outputs(outputs) => {
+                for output in &outputs.entries {
+                    if !self.charge(output.span) {
+                        return;
                     }
-                    for field in &structure.fields {
-                        self.resolve_type(module, &field.ty, &type_locals);
-                        if let Some(default) = &field.default {
-                            self.resolve_expression(
+                    match &output.kind {
+                        crate::OutputKind::Value { name, ty, value } => {
+                            self.with_owner(
                                 module,
-                                default,
-                                &BTreeMap::new(),
-                                &type_locals,
+                                &name.text,
+                                super::ResolutionOwnerPart::Declaration,
+                                output.span,
+                                |resolver| {
+                                    resolver.resolve_type(module, ty, &BTreeMap::new());
+                                    resolver.resolve_expression(
+                                        module,
+                                        value,
+                                        &BTreeMap::new(),
+                                        &BTreeMap::new(),
+                                    );
+                                },
                             );
                         }
-                    }
-                }
-                ItemKind::Resource(declaration) | ItemKind::Value(declaration) => {
-                    for refinement in &declaration.refinements {
-                        if !self.charge(refinement.span) {
-                            return;
-                        }
-                        match &refinement.kind {
-                            // Predicate names are resolved by the caller's
-                            // closed checking policy, not by source lookup.
-                            RefinementKind::Predicate(path) => {
-                                for segment in &path.segments {
-                                    if !self.charge(segment.span) {
-                                        return;
-                                    }
-                                }
-                            }
-                            RefinementKind::Set(values) => {
-                                for value in values {
-                                    let span = match value {
-                                        Literal::Integer(integer) => integer.span,
-                                        Literal::String(string) => string.span,
-                                    };
-                                    if !self.charge(span) {
-                                        return;
-                                    }
-                                    if let Literal::String(string) = value {
-                                        self.resolve_string(string, &BTreeMap::new());
-                                    }
-                                }
-                            }
-                            RefinementKind::Range { .. } => {}
-                        }
-                    }
-                }
-                ItemKind::Function(function) => self.resolve_function(module, function),
-                ItemKind::Outputs(outputs) => {
-                    for output in &outputs.entries {
-                        if !self.charge(output.span) {
-                            return;
-                        }
-                        match &output.kind {
-                            crate::OutputKind::Value { ty, value, .. } => {
-                                self.resolve_type(module, ty, &BTreeMap::new());
-                                self.resolve_expression(
-                                    module,
-                                    value,
-                                    &BTreeMap::new(),
-                                    &BTreeMap::new(),
-                                );
-                            }
-                            crate::OutputKind::Type { ty, .. } => {
-                                self.resolve_type(module, ty, &BTreeMap::new());
-                            }
-                            crate::OutputKind::Function {
-                                signature,
-                                function,
-                                ..
-                            } => {
-                                for parameter in &signature.parameters {
-                                    self.resolve_type(module, parameter, &BTreeMap::new());
-                                }
-                                self.resolve_type(module, &signature.result, &BTreeMap::new());
-                                self.resolve_path(
-                                    module,
-                                    function,
-                                    Expected::Function,
-                                    ReferenceKind::Function,
-                                );
-                            }
+                        crate::OutputKind::Type { ty, .. } => {
+                            self.resolve_type(module, ty, &BTreeMap::new());
                         }
                     }
                 }
@@ -231,10 +256,15 @@ impl Resolver<'_> {
                 self.error("duplicate type parameter", parameter.span);
                 continue;
             }
-            let Some(id) = self.local(parameter.name.span) else {
+            let Some(id) = self.local(&parameter.name, crate::LocalKind::TypeParameter) else {
                 return;
             };
             types.insert(parameter.name.text.clone(), id);
+            self.editor_local(
+                &parameter.name,
+                id,
+                function.name.span.join(function.body.span),
+            );
         }
         for parameter in &function.parameters {
             self.resolve_type(module, &parameter.ty, &types);
@@ -242,10 +272,11 @@ impl Resolver<'_> {
                 self.error("duplicate function parameter", parameter.span);
                 continue;
             }
-            let Some(id) = self.local(parameter.name.span) else {
+            let Some(id) = self.local(&parameter.name, crate::LocalKind::Parameter) else {
                 return;
             };
             locals.insert(parameter.name.text.clone(), id);
+            self.editor_local(&parameter.name, id, function.body.span);
         }
         if let Some(result) = &function.result {
             self.resolve_type(module, result, &types);
@@ -262,12 +293,44 @@ impl Resolver<'_> {
     ) {
         for statement in &block.statements {
             match &statement.kind {
-                StatementKind::Let { name, value } => {
+                StatementKind::Recovery { binding } => {
+                    if let Some(binding) = binding {
+                        if let Some(ty) = &binding.ty {
+                            self.resolve_type(module, ty, types);
+                        }
+                        let Some(id) = self.local(&binding.name, crate::LocalKind::Binding) else {
+                            return;
+                        };
+                        locals.insert(binding.name.text.clone(), id);
+                        self.editor_local(
+                            &binding.name,
+                            id,
+                            crate::Span::new(
+                                block.span.source_id(),
+                                statement.span.end(),
+                                block.span.end(),
+                            ),
+                        );
+                    }
+                }
+                StatementKind::Let { name, ty, value } => {
+                    if let Some(ty) = ty {
+                        self.resolve_type(module, ty, types);
+                    }
                     self.resolve_expression(module, value, locals, types);
-                    let Some(id) = self.local(name.span) else {
+                    let Some(id) = self.local(name, crate::LocalKind::Binding) else {
                         return;
                     };
                     locals.insert(name.text.clone(), id);
+                    self.editor_local(
+                        name,
+                        id,
+                        crate::Span::new(
+                            block.span.source_id(),
+                            statement.span.end(),
+                            block.span.end(),
+                        ),
+                    );
                 }
                 StatementKind::Expression(expression) => {
                     self.resolve_expression(module, expression, locals, types);
@@ -314,6 +377,7 @@ impl Resolver<'_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) fn resolve_expression(
         &mut self,
         module: ModuleId,
@@ -332,6 +396,7 @@ impl Resolver<'_> {
                     self.resolve_string(string, value_locals);
                 }
                 ExpressionKind::Path(path) => self.resolve_value_path(module, path, value_locals),
+                ExpressionKind::Memoize(value) => stack.push(value),
                 ExpressionKind::ModuleExports {
                     namespace,
                     export,
@@ -390,6 +455,7 @@ impl Resolver<'_> {
                     path,
                     type_arguments,
                     fields,
+                    ..
                 } => {
                     self.resolve_path(
                         module,
@@ -472,10 +538,11 @@ impl Resolver<'_> {
                 self.error("duplicate closure parameter", parameter.span);
                 continue;
             }
-            let Some(id) = self.local(parameter.name.span) else {
+            let Some(id) = self.local(&parameter.name, crate::LocalKind::Parameter) else {
                 return;
             };
             locals.insert(parameter.name.text.clone(), id);
+            self.editor_local(&parameter.name, id, body.span);
         }
         self.resolve_type(module, result, type_locals);
         self.resolve_block(module, body, &mut locals, type_locals);

@@ -1,19 +1,30 @@
 use super::{
     Block, Diagnostic, Enum, Field, Function, Input, Inputs, Item, ItemKind, Keyword,
     MAX_DIAGNOSTICS, Module, Output, OutputKind, Outputs, Parameter, Parser, Primitive,
-    PrimitiveDeclaration, Refinement, RefinementKind, Signature, Span, Statement, StatementKind,
-    Struct, Token, TokenKind, Type, TypeAlias, TypeKind, TypeParameter, Use,
+    PrimitiveDeclaration, Refinement, RefinementKind, Span, Statement, StatementKind, Struct,
+    SyntaxKind, Token, TokenKind, Type, TypeAlias, TypeKind, TypeParameter, Use,
 };
 
 impl Parser<'_> {
     pub(super) fn parse_items(&mut self, nested: bool) -> Vec<Item> {
         let mut items = Vec::new();
         while self.peek().is_some() && !(nested && self.at(TokenKind::RightBrace)) {
+            // The lexer already diagnosed these tokens. Keep them in the
+            // lossless stream without cascading an item error for each one.
+            if self.at(TokenKind::Invalid) || self.at(TokenKind::Unparsed) {
+                self.advance();
+                continue;
+            }
             let before = self.at;
-            if let Some(item) = self.parse_item() {
+            let item = self.syntax(SyntaxKind::Declaration, |parser| {
+                let item = parser.parse_item();
+                if item.is_none() {
+                    parser.recover_item(before, nested);
+                }
+                item
+            });
+            if let Some(item) = item {
                 items.push(item);
-            } else {
-                self.recover_item(nested);
             }
             if self.at == before {
                 self.advance();
@@ -26,12 +37,16 @@ impl Parser<'_> {
     }
 
     pub(super) fn parse_item(&mut self) -> Option<Item> {
-        let start_at = self.at;
         let start_depth = self.depth;
+        let diagnostics = self.errors.len();
         let item = self.parse_item_inner();
         self.depth = start_depth;
-        if item.is_none() {
-            self.at = start_at;
+        if item.is_none() && self.errors.len() == diagnostics {
+            self.error(Diagnostic::error(
+                "incomplete declaration",
+                self.peek()
+                    .map_or_else(|| self.eof_span(), |token| token.span),
+            ));
         }
         item
     }
@@ -82,7 +97,7 @@ impl Parser<'_> {
             Keyword::Enum => self.parse_enum(start)?,
             Keyword::Resource => self.parse_primitive_declaration(start, true)?,
             Keyword::Value => self.parse_primitive_declaration(start, false)?,
-            Keyword::Fn => self.parse_function(start)?,
+            Keyword::Fn => self.parse_function(start, public)?,
             _ => {
                 self.error(Diagnostic::error("expected a declaration", start));
                 return None;
@@ -101,12 +116,16 @@ impl Parser<'_> {
         if !self.enter(open.span) {
             return None;
         }
+        let mut child = self.module.to_vec();
+        child.extend(path.segments.iter().map(|segment| segment.text.clone()));
+        let parent = std::mem::replace(&mut self.module, child.into());
         let items = self.parse_items(true);
+        self.module = parent;
         let close = self.expect(TokenKind::RightBrace, "expected `}` after module body");
         self.leave();
-        let close = close?;
+        let end = close.map_or_else(|| self.eof_span(), |token| token.span);
         let _ = start;
-        Some((ItemKind::Module(Module { path, items }), close.span))
+        Some((ItemKind::Module(Module { path, items }), end))
     }
 
     fn parse_use(&mut self, _start: Span) -> Option<(ItemKind, Span)> {
@@ -161,67 +180,31 @@ impl Parser<'_> {
         if !self.enter(open.span) {
             return None;
         }
-        let mut entries = Vec::new();
-        while self.peek().is_some() && !self.at(TokenKind::RightBrace) {
-            let entry_start = self.peek()?.span;
-            let kind = if self.consume_keyword(Keyword::Type).is_some() {
-                let name = self.ident("expected exported type name")?;
-                self.expect(TokenKind::Equal, "expected `=` after exported type name")?;
-                let ty = self.parse_type()?;
+        let (entries, valid) = self.semicolon_entries(SyntaxKind::Output, |parser| {
+            let entry_start = parser.peek()?.span;
+            let kind = if parser.consume_keyword(Keyword::Type).is_some() {
+                let name = parser.ident("expected exported type name")?;
+                parser.expect(TokenKind::Equal, "expected `=` after exported type name")?;
+                let ty = parser.parse_type()?;
                 OutputKind::Type { name, ty }
             } else {
-                let name = self.ident("expected output name")?;
-                self.expect(TokenKind::Colon, "expected `:` after output name")?;
-                if self.at_keyword(Keyword::Fn) {
-                    let signature = self.parse_signature()?;
-                    self.expect(TokenKind::Equal, "expected `=` after function signature")?;
-                    let function = self.parse_path("expected exported function path")?;
-                    OutputKind::Function {
-                        name,
-                        signature,
-                        function,
-                    }
-                } else {
-                    let ty = self.parse_type()?;
-                    self.expect(TokenKind::Equal, "expected `=` after output type")?;
-                    let value = self.parse_expression()?;
-                    OutputKind::Value { name, ty, value }
-                }
+                let name = parser.ident("expected output name")?;
+                parser.expect(TokenKind::Colon, "expected `:` after output name")?;
+                let ty = parser.parse_type()?;
+                parser.expect(TokenKind::Equal, "expected `=` after output type")?;
+                let value = parser.parse_expression()?;
+                OutputKind::Value { name, ty, value }
             };
-            let end = self.expect(TokenKind::Semicolon, "expected `;` after output")?;
-            entries.push(Output {
+            let end = parser.expect(TokenKind::Semicolon, "expected `;` after output")?;
+            Some(Output {
                 kind,
                 span: entry_start.join(end.span),
-            });
-        }
+            })
+        });
         let close = self.expect(TokenKind::RightBrace, "expected `}` after outputs");
         self.leave();
         let close = close?;
-        Some((ItemKind::Outputs(Outputs { entries }), close.span))
-    }
-
-    fn parse_signature(&mut self) -> Option<Signature> {
-        let start = self
-            .expect_keyword(Keyword::Fn, "expected function signature")?
-            .span;
-        let open = self.expect(TokenKind::LeftParen, "expected `(` in function signature")?;
-        if !self.enter(open.span) {
-            return None;
-        }
-        let parameters = self.comma_types(TokenKind::RightParen, true);
-        let close = self.expect(
-            TokenKind::RightParen,
-            "expected `)` after signature parameters",
-        );
-        self.leave();
-        close?;
-        self.expect(TokenKind::Arrow, "expected `->` in function signature")?;
-        let result = self.parse_type()?;
-        Some(Signature {
-            span: start.join(result.span),
-            parameters: parameters?,
-            result,
-        })
+        valid.then_some((ItemKind::Outputs(Outputs { entries }), close.span))
     }
 
     fn parse_type_alias(&mut self, _start: Span) -> Option<(ItemKind, Span)> {
@@ -268,29 +251,28 @@ impl Parser<'_> {
         if !self.enter(open.span) {
             return None;
         }
-        let mut fields = Vec::new();
-        while self.peek().is_some() && !self.at(TokenKind::RightBrace) {
-            let field_start = self.peek()?.span;
-            let field_name = self.ident("expected field name")?;
-            self.expect(TokenKind::Colon, "expected `:` after field name")?;
-            let ty = self.parse_type()?;
-            let default = if self.consume(TokenKind::Equal).is_some() {
-                Some(self.parse_expression()?)
+        let (fields, valid) = self.semicolon_entries(SyntaxKind::Field, |parser| {
+            let field_start = parser.peek()?.span;
+            let field_name = parser.ident("expected field name")?;
+            parser.expect(TokenKind::Colon, "expected `:` after field name")?;
+            let ty = parser.parse_type()?;
+            let default = if parser.consume(TokenKind::Equal).is_some() {
+                Some(parser.parse_expression()?)
             } else {
                 None
             };
-            let end = self.expect(TokenKind::Semicolon, "expected `;` after field")?;
-            fields.push(Field {
+            let end = parser.expect(TokenKind::Semicolon, "expected `;` after field")?;
+            Some(Field {
                 name: field_name,
                 ty,
                 default,
                 span: field_start.join(end.span),
-            });
-        }
+            })
+        });
         let close = self.expect(TokenKind::RightBrace, "expected `}` after struct fields");
         self.leave();
         let close = close?;
-        Some((
+        valid.then_some((
             ItemKind::Struct(Struct {
                 name,
                 opaque,
@@ -508,7 +490,7 @@ impl Parser<'_> {
         })
     }
 
-    fn parse_function(&mut self, _start: Span) -> Option<(ItemKind, Span)> {
+    fn parse_function(&mut self, start: Span, public: bool) -> Option<(ItemKind, Span)> {
         let name = self.ident("expected function name")?;
         let type_parameters = if self.at(TokenKind::LeftAngle) {
             self.parse_type_parameters()?
@@ -544,7 +526,51 @@ impl Parser<'_> {
         } else {
             None
         };
-        let body = self.parse_block()?;
+        self.signatures.push(super::FunctionSignature {
+            module: self.module.clone(),
+            public,
+            name: name.clone(),
+            type_parameters: type_parameters.clone(),
+            parameters: parameters.clone(),
+            result: result.clone(),
+            span: start.join(self.tokens[self.at - 1].span),
+        });
+        let body_at = self.at;
+        let body = if let Some(body) = self.parse_block() {
+            body
+        } else {
+            self.incomplete_bodies.push(name.span);
+            if self
+                .tokens
+                .get(body_at)
+                .is_some_and(|token| token.kind == TokenKind::LeftBrace)
+            {
+                self.recover_item(body_at, true);
+            }
+            Block {
+                incomplete: true,
+                statements: Vec::new(),
+                tail: None,
+                // Retain the recovered body's lexical extent for editor scope
+                // queries. `incomplete_bodies` still marks this AST unavailable.
+                span: if self.at > body_at {
+                    self.tokens[body_at]
+                        .span
+                        .join(self.tokens[self.at - 1].span)
+                } else {
+                    self.peek().map_or_else(
+                        || self.eof_span(),
+                        |token| {
+                            Span::new(
+                                token.span.source_id(),
+                                token.span.start(),
+                                token.span.start(),
+                            )
+                        },
+                    )
+                },
+            }
+        };
         let end = body.span;
         Some((
             ItemKind::Function(Function {
@@ -559,47 +585,185 @@ impl Parser<'_> {
     }
 
     pub(super) fn parse_block(&mut self) -> Option<Block> {
+        self.syntax(SyntaxKind::Block, Self::parse_block_inner)
+    }
+
+    fn parse_block_inner(&mut self) -> Option<Block> {
         let open = self.expect(TokenKind::LeftBrace, "expected function body")?;
         if !self.enter(open.span) {
             return None;
         }
         let mut statements = Vec::new();
         let mut tail = None;
-        while self.peek().is_some() && !self.at(TokenKind::RightBrace) {
+        let mut incomplete = false;
+        let errors_before = self.error_count;
+        while self.peek().is_some() && !self.at(TokenKind::RightBrace) && !self.body_item_boundary()
+        {
+            let start_at = self.at;
             let start = self.peek()?.span;
-            if self.consume_keyword(Keyword::Let).is_some() {
-                let name = self.ident("expected name after `let`")?;
-                self.expect(TokenKind::Equal, "expected `=` in let statement")?;
-                let value = self.parse_expression()?;
-                let end = self.expect(TokenKind::Semicolon, "expected `;` after let statement")?;
-                statements.push(Statement {
-                    kind: StatementKind::Let { name, value },
-                    span: start.join(end.span),
-                });
-                continue;
-            }
-            let expression = self.parse_expression()?;
-            if let Some(end) = self.consume(TokenKind::Semicolon) {
-                statements.push(Statement {
-                    kind: StatementKind::Expression(expression),
-                    span: start.join(end.span),
-                });
+            let mut binding = None;
+            let statement = if self.consume_keyword(Keyword::Let).is_some() {
+                self.parse_let_statement(start, &mut binding)
             } else {
-                tail = Some(Box::new(expression));
+                (|| {
+                    let expression = self.parse_expression()?;
+                    if let Some(end) = self.consume(TokenKind::Semicolon) {
+                        Some(Statement {
+                            kind: StatementKind::Expression(expression),
+                            span: start.join(end.span),
+                        })
+                    } else if self.at(TokenKind::RightBrace) || self.peek().is_none() {
+                        tail = Some(Box::new(expression));
+                        None
+                    } else {
+                        self.expect(TokenKind::Semicolon, "expected `;` after expression")?;
+                        None
+                    }
+                })()
+            };
+            if tail.is_some() {
                 break;
             }
+            if let Some(statement) = statement {
+                statements.push(statement);
+            } else {
+                incomplete = true;
+                self.recover_statement(start_at);
+                let end = self
+                    .tokens
+                    .get(self.at.saturating_sub(1))
+                    .map_or(start, |token| token.span);
+                statements.push(Statement {
+                    kind: StatementKind::Recovery { binding },
+                    span: start.join(end),
+                });
+                if self.at == start_at || self.errors.len() == MAX_DIAGNOSTICS {
+                    break;
+                }
+            }
         }
-        let close = self.expect(TokenKind::RightBrace, "expected `}` after function body");
+        let complete = self.expect(TokenKind::RightBrace, "expected `}` after function body");
         self.leave();
-        let close = close?;
+        let end = complete.map_or_else(
+            || {
+                self.tokens
+                    .get(self.at.saturating_sub(1))
+                    .map_or(open.span, |token| token.span)
+            },
+            |token| token.span,
+        );
         Some(Block {
             statements,
             tail,
-            span: open.span.join(close.span),
+            span: open.span.join(end),
+            incomplete: incomplete || complete.is_none() || errors_before != self.error_count,
         })
     }
 
+    fn parse_let_statement(
+        &mut self,
+        start: Span,
+        recovered: &mut Option<crate::RecoveredBinding>,
+    ) -> Option<Statement> {
+        let name = self.ident("expected name after `let`")?;
+        *recovered = Some(crate::RecoveredBinding {
+            name: name.clone(),
+            ty: None,
+        });
+        let ty = if self.consume(TokenKind::Colon).is_some() {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        recovered.as_mut()?.ty.clone_from(&ty);
+        self.expect(TokenKind::Equal, "expected `=` in let statement")?;
+        let value = self.parse_expression()?;
+        let end = self.expect(TokenKind::Semicolon, "expected `;` after let statement");
+        let end = match end {
+            Some(end) => end.span,
+            None if self.peek().is_none() => value.span,
+            None => return None,
+        };
+        Some(Statement {
+            kind: StatementKind::Let { name, ty, value },
+            span: start.join(end),
+        })
+    }
+
+    fn body_item_boundary(&self) -> bool {
+        matches!(
+            self.peek().map(|token| token.kind),
+            Some(TokenKind::Keyword(
+                Keyword::Pub
+                    | Keyword::Mod
+                    | Keyword::Use
+                    | Keyword::Inputs
+                    | Keyword::Outputs
+                    | Keyword::Type
+                    | Keyword::Struct
+                    | Keyword::Opaque
+                    | Keyword::Enum
+                    | Keyword::Resource
+                    | Keyword::Value
+            ))
+        ) || self.at_keyword(Keyword::Fn)
+            && self
+                .tokens
+                .get(self.at + 1)
+                .is_some_and(|token| token.kind == TokenKind::Ident)
+    }
+
+    fn recover_statement(&mut self, start: usize) {
+        // Braces delimit scopes. Missing parentheses/brackets may synchronize at
+        // a semicolon, but a nested closure/struct body must never escape its scope.
+        let mut braces = 0usize;
+        for token in &self.tokens[start..self.at] {
+            if self.cancelled() {
+                return;
+            }
+            match token.kind {
+                TokenKind::LeftBrace => braces += 1,
+                TokenKind::RightBrace => braces = braces.saturating_sub(1),
+                _ => {}
+            }
+        }
+        self.events.push(super::Event::Start(SyntaxKind::Error));
+        while let Some(token) = self.peek() {
+            if braces == 0 {
+                if token.kind == TokenKind::Semicolon {
+                    self.advance();
+                    break;
+                }
+                if token.kind == TokenKind::RightBrace
+                    || self.at_keyword(Keyword::Let)
+                    || self.body_item_boundary()
+                {
+                    break;
+                }
+            }
+            match token.kind {
+                TokenKind::LeftBrace => braces += 1,
+                TokenKind::RightBrace => braces = braces.saturating_sub(1),
+                _ => {}
+            }
+            self.advance();
+        }
+        self.events.push(super::Event::Finish { failed: true });
+    }
+
     pub(super) fn parse_type(&mut self) -> Option<Type> {
+        self.syntax(SyntaxKind::Type, |parser| {
+            let span = parser
+                .peek()
+                .map_or_else(|| parser.eof_span(), |token| token.span);
+            if !parser.enter(span) {
+                return None;
+            }
+            parser.parse_type_inner()
+        })
+    }
+
+    fn parse_type_inner(&mut self) -> Option<Type> {
         let once = self.consume_keyword(Keyword::Once);
         if once.is_some() && !self.at_keyword(Keyword::Fn) {
             self.expect_keyword(Keyword::Fn, "expected `fn` after `once`")?;

@@ -840,6 +840,124 @@ fn opaque_construction_rejects_a_different_authenticated_domain() {
 }
 
 #[test]
+fn opaque_fields_are_private_through_aliases_projection_chains_and_interpolation() {
+    for body in [
+        "fn leak(item: vault::Secret<I>) -> I { item.payload }",
+        "type Alias = vault::Secret<I>; fn leak(item: Alias) -> I { item.payload }",
+        "struct Holder { hidden: vault::Secret<I>; } fn leak(item: Holder) -> I { item.hidden.payload }",
+        "fn leak(item: vault::Secret<I>) -> S { S(\"${item.payload}\") }",
+        "mod impostor { pub use vault::Secret; fn leak(item: Secret<I>) -> I { item.payload } }",
+    ] {
+        let source = format!(
+            r"
+            value I(int); value S(str);
+            mod vault {{
+                pub opaque struct Secret<T> {{ payload: T; }}
+                pub fn reveal<T>(item: Secret<T>) -> T {{ item.payload }}
+                mod nested {{ fn reveal<T>(item: Secret<T>) -> T {{ item.payload }} }}
+            }}
+            {body}
+        "
+        );
+        let errors = messages(&source);
+        assert!(
+            errors
+                .iter()
+                .any(|message| message.contains("opaque struct fields are private")),
+            "{errors:?}"
+        );
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|message| message.contains("opaque struct fields are private"))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn opaque_representation_authority_is_lexical_or_explicitly_delegated() {
+    check(
+        resolved(
+            r"
+        value I(int);
+        mod vault {
+            pub opaque struct Secret<owner O> { payload: I; }
+            pub fn reveal(item: Secret<agent::Owner>) -> I { item.payload }
+        }
+        mod agent {
+            pub struct Owner {}
+            pub fn make() -> vault::Secret<Owner> { vault::Secret<Owner> { payload = I(1); } }
+            pub fn reveal(item: vault::Secret<Owner>) -> I { item.payload }
+        }
+        outputs { result: I = vault::reveal(agent::make()); }
+    ",
+        ),
+        &CheckPolicy::default(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn opaque_field_access_cannot_be_obtained_by_reexporting_an_authenticated_type() {
+    let mut sources = SourceSet::new();
+    sources
+        .add_standard_library(
+            "std.srx",
+            r"
+        mod std {
+            pub value I(int);
+            pub opaque struct Secret { payload: I; }
+            pub fn reveal(item: Secret) -> I { item.payload }
+        }
+    ",
+        )
+        .unwrap();
+    sources
+        .add(
+            "main.srx",
+            r"
+        pub use std::Secret;
+        fn valid(item: Secret) -> std::I { std::reveal(item) }
+        fn invalid(item: Secret) -> std::I { item.payload }
+    ",
+        )
+        .unwrap();
+    let errors = check(
+        resolve(parse_sources(&sources).unwrap()).unwrap(),
+        &CheckPolicy::default(),
+    )
+    .unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0]
+            .message
+            .contains("opaque struct fields are private")
+    );
+}
+
+#[test]
+fn direct_calls_cannot_copy_affine_outputs_or_call_plain_values() {
+    let errors = messages(
+        "value I(int); outputs { factory: once fn() -> I = once fn() -> I { I(1) }; bad: I = factory(); }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("value output cannot carry an affine resource")),
+        "{errors:?}"
+    );
+    let errors = messages("value I(int); outputs { number: I = I(1); bad: I = number(); }");
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("callee is not a function value")),
+        "{errors:?}"
+    );
+}
+
+#[test]
 fn refinements_are_validated_against_closed_policy_data() {
     let policy = CheckPolicy::new("test")
         .unwrap()
@@ -1143,4 +1261,26 @@ fn checked_metadata_builds_complete_span_indexes_once() {
             .expressions()
             .all(|expression| program.expression(expression.span()).is_some())
     );
+}
+#[test]
+fn editor_retention_does_not_exhaust_language_metadata_or_change_diagnostics() {
+    let mut sources = SourceSet::new();
+    sources.add("main.srx", "value I(int); struct Box<T> { entry: T; } fn inspect(x: I) { let one = x; let two = one; let three = two; }").unwrap();
+    let program = resolve(parse_sources(&sources).unwrap()).unwrap();
+    let policy = CheckPolicy::default();
+    let limits = CheckLimits {
+        max_metadata_units: 4,
+        ..CheckLimits::default()
+    };
+    let mut strict = Checker::new(&program, &policy, limits);
+    strict.run();
+    let cancellation = crate::AnalysisCancellation::default();
+    let mut editor = Checker::new(&program, &policy, limits);
+    editor.cancellation = Some(&cancellation);
+    editor.run();
+    assert!(strict.diagnostics.is_empty(), "{:?}", strict.diagnostics);
+    assert_eq!(strict.diagnostics, editor.diagnostics);
+    assert_eq!(strict.work, editor.work);
+    assert!(editor.editor.truncated);
+    assert!(editor.editor.units <= limits.max_metadata_units);
 }

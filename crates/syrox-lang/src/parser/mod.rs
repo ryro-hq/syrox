@@ -2,14 +2,29 @@ use crate::ast::{
     Block, Enum, Expression, ExpressionKind, Field, Function, Ident, Input, Inputs, IntegerLiteral,
     Item, ItemKind, Literal, MatchArm, Module, Output, OutputKind, Outputs, Parameter,
     ParsedProgram, ParsedSource, ParsedSources, Path, Pattern, Primitive, PrimitiveDeclaration,
-    Refinement, RefinementKind, Signature, Statement, StatementKind, StringLiteral, StringPart,
-    Struct, StructField, Type, TypeAlias, TypeKind, TypeParameter, Use,
+    Refinement, RefinementKind, Statement, StatementKind, StringLiteral, StringPart, Struct,
+    StructField, Type, TypeAlias, TypeKind, TypeParameter, Use,
 };
 use crate::lexer::{Keyword, Token, TokenKind, is_keyword, lex};
-use crate::{Diagnostic, MAX_DEPTH, MAX_DIAGNOSTICS, Source, SourceId, SourceSet, Span};
+use crate::{
+    Diagnostic, DiagnosticCode, MAX_DEPTH, MAX_DIAGNOSTICS, Source, SourceId, SourceSet, Span,
+    SyntaxExpectation,
+};
 
 mod expressions;
 mod items;
+mod parsed_file;
+mod syntax;
+pub(crate) use parsed_file::parse_file_cancellable;
+pub(crate) use parsed_file::parse_file_in;
+
+use syntax::Event;
+pub use syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxTree};
+
+pub use parsed_file::{
+    FunctionSignature, Keyword as SyntaxKeyword, ParsedFile, SyntaxToken, SyntaxTokenKind,
+    parse_file,
+};
 
 #[cfg(test)]
 mod tests;
@@ -59,41 +74,94 @@ pub fn parse_sources(sources: &SourceSet) -> Result<ParsedSources, Vec<Diagnosti
 }
 
 fn parse_source(source_id: SourceId, source: &Source) -> Result<ParsedProgram, Vec<Diagnostic>> {
-    let tokens = lex(source_id, source)?;
-    Parser::new(source_id, source, &tokens).parse()
+    parse_file_in(source_id, source).into_program()
 }
 
 struct Parser<'a> {
+    cancellation: Option<&'a crate::AnalysisCancellation>,
     source_id: SourceId,
     source: &'a Source,
     tokens: &'a [Token],
     at: usize,
     depth: usize,
     errors: Vec<Diagnostic>,
+    events: Vec<Event>,
+    error_count: usize,
+    module: std::sync::Arc<[String]>,
+    signatures: Vec<FunctionSignature>,
+    incomplete_bodies: Vec<Span>,
+}
+
+struct ParseResult {
+    program: ParsedProgram,
+    diagnostics: Vec<Diagnostic>,
+    events: Vec<Event>,
+    signatures: Vec<FunctionSignature>,
+    incomplete_bodies: Vec<Span>,
 }
 
 impl<'a> Parser<'a> {
     fn new(source_id: SourceId, source: &'a Source, tokens: &'a [Token]) -> Self {
         Self {
+            cancellation: None,
             source_id,
             source,
             tokens,
             at: 0,
             depth: 0,
             errors: Vec::new(),
+            events: Vec::new(),
+            error_count: 0,
+            module: std::sync::Arc::from([]),
+            signatures: Vec::new(),
+            incomplete_bodies: Vec::new(),
         }
     }
 
-    fn parse(mut self) -> Result<ParsedProgram, Vec<Diagnostic>> {
+    fn parse(mut self) -> ParseResult {
         let items = self.parse_items(false);
-        if self.errors.is_empty() {
-            Ok(ParsedProgram { items })
-        } else {
-            Err(self.errors)
+        ParseResult {
+            program: ParsedProgram { items },
+            diagnostics: self.errors,
+            events: self.events,
+            signatures: self.signatures,
+            incomplete_bodies: self.incomplete_bodies,
         }
+    }
+
+    fn syntax<T>(
+        &mut self,
+        kind: SyntaxKind,
+        parse: impl FnOnce(&mut Self) -> Option<T>,
+    ) -> Option<T> {
+        self.events.push(Event::Start(kind));
+        let depth = self.depth;
+        let errors = self.error_count;
+        let result = parse(self);
+        self.depth = depth;
+        if result.is_none() && self.error_count == errors {
+            self.error(Diagnostic::error(
+                "incomplete syntax",
+                self.peek()
+                    .map_or_else(|| self.eof_span(), |token| token.span),
+            ));
+        }
+        self.events.push(Event::Finish {
+            failed: result.is_none() || self.error_count != errors,
+        });
+        result
+    }
+
+    fn missing(&mut self, kind: SyntaxKind) {
+        self.events.push(Event::Start(kind));
+        self.events.push(Event::Finish { failed: true });
     }
 
     fn parse_path(&mut self, message: &str) -> Option<Path> {
+        self.syntax(SyntaxKind::Path, |parser| parser.parse_path_inner(message))
+    }
+
+    fn parse_path_inner(&mut self, message: &str) -> Option<Path> {
         let first = self.ident(message)?;
         let start = first.span;
         let mut end = first.span;
@@ -101,7 +169,7 @@ impl<'a> Parser<'a> {
         while self.at(TokenKind::ColonColon)
             && self
                 .peek_n(1)
-                .is_some_and(|token| token.kind == TokenKind::Ident)
+                .is_none_or(|token| token.kind != TokenKind::LeftBrace)
         {
             self.advance();
             let segment = self.ident("expected path segment after `::`")?;
@@ -157,25 +225,79 @@ impl<'a> Parser<'a> {
     }
 
     fn comma_expressions(&mut self, close: TokenKind) -> Option<Vec<Expression>> {
+        self.syntax(SyntaxKind::Arguments, |parser| {
+            parser.comma_expressions_inner(close)
+        })
+    }
+
+    fn comma_expressions_inner(&mut self, close: TokenKind) -> Option<Vec<Expression>> {
         let mut values = Vec::new();
+        let mut valid = true;
         if self.at(close) {
             return Some(values);
         }
         loop {
-            values.push(self.parse_expression()?);
+            if let Some(value) = self.syntax(SyntaxKind::Argument, Self::parse_expression) {
+                values.push(value);
+            } else {
+                valid = false;
+                self.recover_entry(TokenKind::Comma, close);
+            }
+            if self.errors.len() == MAX_DIAGNOSTICS {
+                return None;
+            }
             if self.consume(TokenKind::Comma).is_none() || self.at(close) {
                 break;
             }
         }
-        Some(values)
+        valid.then_some(values)
+    }
+
+    fn semicolon_entries<T>(
+        &mut self,
+        kind: SyntaxKind,
+        parse: impl FnMut(&mut Self) -> Option<T>,
+    ) -> (Vec<T>, bool) {
+        let (values, recovery) = self.recoverable_entries(kind, parse);
+        (values, recovery.is_empty())
+    }
+
+    fn recoverable_entries<T>(
+        &mut self,
+        kind: SyntaxKind,
+        mut parse: impl FnMut(&mut Self) -> Option<T>,
+    ) -> (Vec<T>, Vec<Span>) {
+        let mut values = Vec::new();
+        let mut recovery = Vec::new();
+        while self.peek().is_some() && !self.at(TokenKind::RightBrace) {
+            let start = self.at;
+            let value = self.syntax(kind, |parser| parse(parser));
+            if let Some(value) = value {
+                values.push(value);
+            } else {
+                // A missing semicolon should not consume the following field.
+                let next_entry = self.at > start
+                    && self.at(TokenKind::Ident)
+                    && self.peek_n(1).is_some_and(|token| {
+                        matches!(token.kind, TokenKind::Equal | TokenKind::Colon)
+                    });
+                if !next_entry {
+                    self.recover_entry(TokenKind::Semicolon, TokenKind::RightBrace);
+                    self.consume(TokenKind::Semicolon);
+                }
+                let first = self.tokens[start].span;
+                let last = self.tokens[self.at.saturating_sub(1).max(start)].span;
+                recovery.push(first.join(last));
+            }
+            if self.at == start || self.errors.len() == MAX_DIAGNOSTICS {
+                break;
+            }
+        }
+        (values, recovery)
     }
 
     fn ident(&mut self, message: &str) -> Option<Ident> {
-        let token = self.advance()?;
-        if token.kind != TokenKind::Ident {
-            self.error(Diagnostic::error(message, token.span));
-            return None;
-        }
+        let token = self.expect(TokenKind::Ident, message)?;
         Some(Ident {
             text: self.text(token.span).to_owned(),
             span: token.span,
@@ -199,49 +321,124 @@ impl<'a> Parser<'a> {
         self.depth -= 1;
     }
 
-    fn recover_item(&mut self, nested: bool) {
+    fn recover_item(&mut self, start: usize, nested: bool) {
         let mut depth = 0usize;
-        while let Some(token) = self.peek() {
+        let mut cursor = start;
+        while let Some(token) = self.tokens.get(cursor) {
+            if self.cancelled() {
+                return;
+            }
+            let reached_failure = cursor >= self.at;
             match token.kind {
+                TokenKind::Keyword(
+                    Keyword::Pub
+                    | Keyword::Mod
+                    | Keyword::Use
+                    | Keyword::Inputs
+                    | Keyword::Outputs
+                    | Keyword::Type
+                    | Keyword::Struct
+                    | Keyword::Opaque
+                    | Keyword::Enum
+                    | Keyword::Resource
+                    | Keyword::Value
+                    | Keyword::Fn,
+                ) if depth == 0 && cursor > start && reached_failure => break,
                 TokenKind::LeftBrace | TokenKind::LeftBracket | TokenKind::LeftParen => depth += 1,
                 TokenKind::RightBrace if depth == 0 => {
-                    if !nested {
-                        self.advance();
+                    if reached_failure {
+                        if !nested {
+                            cursor += 1;
+                        }
+                        break;
                     }
-                    return;
                 }
                 TokenKind::RightBrace | TokenKind::RightBracket | TokenKind::RightParen => {
                     depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        self.advance();
-                        return;
+                    if depth == 0 && reached_failure {
+                        cursor += 1;
+                        break;
                     }
                 }
-                TokenKind::Semicolon if depth == 0 => {
-                    self.advance();
-                    return;
+                TokenKind::Semicolon if depth == 0 && reached_failure => {
+                    cursor += 1;
+                    break;
+                }
+                _ => {}
+            }
+            cursor += 1;
+        }
+        if cursor > self.at {
+            self.events.push(Event::Start(SyntaxKind::Error));
+            while self.at < cursor {
+                if self.advance().is_none() {
+                    break;
+                }
+            }
+            self.events.push(Event::Finish { failed: true });
+        }
+    }
+
+    /// Skip only the malformed portion of an entry. Enclosing delimiters are
+    /// left for their owner, and balanced nested constructs are skipped whole.
+    fn recover_entry(&mut self, separator: TokenKind, close: TokenKind) {
+        self.events.push(Event::Start(SyntaxKind::Error));
+        let mut closing = Vec::new();
+        while let Some(token) = self.peek() {
+            if closing.is_empty()
+                && (token.kind == separator
+                    || token.kind == close
+                    || matches!(
+                        token.kind,
+                        TokenKind::RightBrace
+                            | TokenKind::RightParen
+                            | TokenKind::RightBracket
+                            | TokenKind::Semicolon
+                    ))
+            {
+                break;
+            }
+            match token.kind {
+                TokenKind::LeftBrace => closing.push(TokenKind::RightBrace),
+                TokenKind::LeftParen => closing.push(TokenKind::RightParen),
+                TokenKind::LeftBracket => closing.push(TokenKind::RightBracket),
+                TokenKind::RightBrace | TokenKind::RightParen | TokenKind::RightBracket
+                    if closing.pop() != Some(token.kind) =>
+                {
+                    break;
                 }
                 _ => {}
             }
             self.advance();
         }
+        self.events.push(Event::Finish { failed: true });
     }
 
     fn error(&mut self, diagnostic: Diagnostic) {
+        self.error_count += 1;
         if self.errors.len() < MAX_DIAGNOSTICS {
-            self.errors.push(diagnostic);
+            self.errors
+                .push(diagnostic.in_phase(DiagnosticCode::Syntax));
         }
     }
 
     fn expect(&mut self, kind: TokenKind, message: &str) -> Option<Token> {
-        let Some(token) = self.advance() else {
-            self.error(Diagnostic::error(message, self.eof_span()));
+        let Some(token) = self.peek() else {
+            self.error(
+                Diagnostic::error(message, self.eof_span())
+                    .with_expected(SyntaxExpectation::Token(kind)),
+            );
+            self.missing(SyntaxKind::MissingToken(kind));
             return None;
         };
         if token.kind == kind {
-            Some(token)
+            self.advance()
         } else {
-            self.error(Diagnostic::error(message, token.span));
+            self.error(
+                Diagnostic::error(message, token.span)
+                    .with_expected(SyntaxExpectation::Token(kind)),
+            );
+            self.missing(SyntaxKind::MissingToken(kind));
             None
         }
     }
@@ -271,12 +468,21 @@ impl<'a> Parser<'a> {
     }
 
     fn peek_n(&self, offset: usize) -> Option<Token> {
+        if self.cancelled() {
+            return None;
+        }
         self.tokens.get(self.at + offset).copied()
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancellation
+            .is_some_and(|cancel| cancel.check().is_err())
     }
 
     fn advance(&mut self) -> Option<Token> {
         let token = self.peek()?;
         self.at += 1;
+        self.events.push(Event::Token);
         Some(token)
     }
 

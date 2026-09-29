@@ -77,6 +77,10 @@ pub enum PrimitiveValue {
 /// copies are explicit and reject resource-bearing values.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Value {
+    MemoizedFunction {
+        ty: Arc<CanonicalType>,
+        id: super::MemoId,
+    },
     VariantConstructor {
         ty: Arc<CanonicalType>,
         index: u32,
@@ -130,6 +134,7 @@ impl Value {
             | Self::Variant { ty, .. }
             | Self::List { ty, .. }
             | Self::Function { ty, .. }
+            | Self::MemoizedFunction { ty, .. }
             | Self::VariantConstructor { ty, .. }
             | Self::Closure { ty, .. } => ty.clone(),
         }
@@ -148,7 +153,8 @@ impl Value {
             | Self::Int(_)
             | Self::Str(_)
             | Self::VariantConstructor { .. }
-            | Self::Function { .. } => false,
+            | Self::Function { .. }
+            | Self::MemoizedFunction { .. } => false,
         }
     }
 }
@@ -186,9 +192,13 @@ pub struct RealizedRoot {
     pub(super) ty: Option<Arc<CanonicalType>>,
     pub(super) outcome: RealizedRootOutcome,
     pub(super) claims: Vec<ResourceClaim>,
+    pub(super) selected: bool,
 }
 
 impl RealizedRoot {
+    pub fn is_selected(&self) -> bool {
+        self.selected
+    }
     pub fn name(&self) -> &str {
         &self.name
     }

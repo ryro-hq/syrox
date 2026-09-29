@@ -20,8 +20,6 @@ use super::LoadedProjectAsset;
 #[cfg(target_os = "linux")]
 use super::analyze::{check_sources, validate_loaded};
 #[cfg(target_os = "linux")]
-use super::catalog::{generated_exports, selected_input};
-#[cfg(target_os = "linux")]
 use super::locator::{InputLocator, root_input_locators};
 use super::{
     CheckConfiguration, CheckFailure, LoadedProject, LoadedProjectInput, LoadedProjectSource,
@@ -137,16 +135,6 @@ pub(super) fn validate_project_linux(
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn check_file_linux(
-    path: &Path,
-    configuration: &CheckConfiguration,
-) -> Result<super::CheckReport, CheckFailure> {
-    let mut budget = LoadBudget::new(configuration.project_limits);
-    let opened = open_top(path, &mut budget)?;
-    check_open_file(path, opened, configuration, &mut budget)
-}
-
-#[cfg(target_os = "linux")]
 fn check_open_file(
     path: &Path,
     opened: OpenedPath,
@@ -211,14 +199,6 @@ fn load_open_project_graph(
             errors,
         })?;
     let locators = root_input_locators(&parsed_main)?;
-    selected_input(
-        parsed_main
-            .iter()
-            .next()
-            .expect("main was parsed")
-            .program(),
-    )?;
-
     validate_input_paths(path, &locators, budget)?;
     let mut directory_identities = HashMap::new();
     directory_identities.insert(identity(&project), path.to_path_buf());
@@ -255,19 +235,6 @@ fn load_open_project_graph(
         budget,
         graph,
     )?;
-    if let Some(generated) = generated_exports(
-        &sources,
-        parsed_main
-            .iter()
-            .next()
-            .expect("main was parsed")
-            .program(),
-        &retained_inputs,
-    )? {
-        budget.reserve_source()?;
-        budget.reserve_bytes(generated.len())?;
-        sources.add("<locked-catalog-exports>", generated)?;
-    }
     Ok(LoadedProject {
         path: path.to_path_buf(),
         root: project,
@@ -439,7 +406,7 @@ fn load_input_sources(
                     module.push(stem.to_owned());
                 }
                 if let Some(first) = module_owners.insert(module.clone(), relative.clone()) {
-                    return Err(CheckFailure::InvalidCatalog {
+                    return Err(CheckFailure::InvalidModuleInput {
                         reason: format!(
                             "files `{}` and `{}` share one recipe module",
                             first.display(),
@@ -608,151 +575,6 @@ fn hash_asset(
     Ok((hasher.finalize().into(), size))
 }
 
-/// Load a child project from a separately opened root. The caller owns graph
-/// admission and must authenticate the edge in its lock before exposing it.
-#[cfg(all(target_os = "linux", test))]
-pub(super) struct ChildSnapshotAdmission<'a> {
-    pub(super) configuration: &'a CheckConfiguration,
-    pub(super) directory_identities: &'a mut HashMap<FileIdentity, PathBuf>,
-    pub(super) file_identities: &'a mut HashMap<FileIdentity, PathBuf>,
-    pub(super) budget: &'a mut LoadBudget,
-}
-
-#[cfg(all(target_os = "linux", test))]
-pub(super) fn load_child_project_snapshot(
-    sources: &mut SourceSet,
-    parent: SourceDomainId,
-    alias: &str,
-    path: &Path,
-    admission: &mut ChildSnapshotAdmission<'_>,
-) -> Result<(SourceDomainId, Vec<LoadedProjectInput>), CheckFailure> {
-    let ChildSnapshotAdmission {
-        configuration,
-        directory_identities,
-        file_identities,
-        budget,
-    } = admission;
-    let root = open_top(path, budget)?;
-    if file_type(&root) != FileType::Directory {
-        return Err(CheckFailure::InputNotDirectory {
-            path: path.to_path_buf(),
-        });
-    }
-    if let Some(first) = directory_identities.insert(identity(&root), path.to_path_buf()) {
-        return Err(CheckFailure::AliasedInputPaths {
-            first,
-            second: path.to_path_buf(),
-        });
-    }
-    let main_path = path.join("main.srx");
-    let main = match open_beneath(root.fd(), Path::new("main.srx"), &main_path, false, budget) {
-        Err(CheckFailure::Inspect { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-            return Err(CheckFailure::MissingMain { path: main_path });
-        }
-        result => result?,
-    };
-    validate_source_handle(&main, &main_path)?;
-    if let Some(first) = file_identities.insert(identity(&main), main_path.clone()) {
-        return Err(CheckFailure::AliasedSourceFiles {
-            first,
-            second: main_path,
-        });
-    }
-    budget.reserve_source()?;
-    let text = read_source_handle(main, &main_path, budget)?;
-    let mut main_sources = SourceSet::new();
-    main_sources.add(main_path.display().to_string(), text.clone())?;
-    let parsed =
-        syrox_lang::parse_sources(&main_sources).map_err(|errors| CheckFailure::Diagnostics {
-            input: main_sources,
-            errors,
-        })?;
-    let main = parsed
-        .iter()
-        .next()
-        .expect("child main was parsed")
-        .program();
-    let locators = root_input_locators(&parsed)?;
-    selected_input(main)?;
-    validate_input_paths(path, &locators, budget)?;
-    let mut loaded = Vec::with_capacity(locators.len());
-    for locator in &locators {
-        let input = open_input_root(
-            path,
-            root.fd(),
-            &locator.name,
-            &locator.relative,
-            directory_identities,
-            budget,
-        )?;
-        let files = walk_input(path, input, directory_identities, file_identities, budget)?;
-        loaded.push(LoadedInput {
-            name: locator.name.clone(),
-            relative: locator.relative.clone(),
-            modules: locator.modules,
-            files,
-        });
-    }
-    let mut pinned_sources = SourceSet::new();
-    let pinned_main = pinned_sources.add(main_path.display().to_string(), text.clone())?;
-    let pinned_inputs = load_input_sources(
-        &mut pinned_sources,
-        SourceDomainId::project(),
-        loaded.clone(),
-    )?;
-    let pinned = LoadedProject {
-        path: path.to_path_buf(),
-        root,
-        sources: pinned_sources,
-        main_source: pinned_main,
-        inputs: pinned_inputs,
-        assets: Vec::new(),
-        child_edges: Vec::new(),
-        children: Vec::new(),
-    };
-    let expected =
-        crate::lock::LockManifest::generate(&pinned, configuration.standard_library.as_ref())
-            .map_err(|error| CheckFailure::InvalidChildLock {
-                path: path.to_path_buf(),
-                reason: error.to_string(),
-            })?;
-    verify_child_lock(&pinned, &expected)?;
-    admit_child_snapshot(
-        sources,
-        parent,
-        alias,
-        main,
-        (main_path, text),
-        loaded,
-        budget,
-    )
-}
-
-#[cfg(all(target_os = "linux", test))]
-fn admit_child_snapshot(
-    sources: &mut SourceSet,
-    parent: SourceDomainId,
-    alias: &str,
-    main: &syrox_lang::ParsedProgram,
-    main_source: (PathBuf, String),
-    loaded: Vec<LoadedInput>,
-    budget: &mut LoadBudget,
-) -> Result<(SourceDomainId, Vec<LoadedProjectInput>), CheckFailure> {
-    let domain = sources.create_project_domain(parent, alias)?;
-    sources.add_to_project_domain(domain, main_source.0.display().to_string(), main_source.1)?;
-    let inputs = load_input_sources(sources, domain, loaded)?;
-    if let Some(generated) = generated_exports(sources, main, &inputs)? {
-        budget.reserve_source()?;
-        budget.reserve_bytes(generated.len())?;
-        sources.add_to_project_domain(
-            domain,
-            format!("<locked-catalog-exports:{alias}>"),
-            generated,
-        )?;
-    }
-    Ok((domain, inputs))
-}
-
 #[cfg(target_os = "linux")]
 fn verify_child_lock(
     project: &LoadedProject,
@@ -824,10 +646,8 @@ fn graft_child(
         child.main_source().name(),
         child.main_source().text(),
     )?;
-    let mut child_inputs = Vec::new();
     for input in child.inputs() {
         let target = sources.create_child_input_domain(domain, input.name())?;
-        let mut files = Vec::new();
         for file in input.files() {
             let source = child
                 .sources()
@@ -845,46 +665,14 @@ fn graft_child(
                 if stem != "package" || module.is_empty() {
                     module.push(stem.to_owned());
                 }
-                files.push(LoadedProjectSource {
-                    relative_path: file.relative_path().to_path_buf(),
-                    source_id: sources.add_to_input_module(target, name, source.text(), module)?,
-                });
+                sources.add_to_input_module(target, name, source.text(), module)?;
             } else {
-                files.push(LoadedProjectSource {
-                    relative_path: file.relative_path().to_path_buf(),
-                    source_id: sources.add_to_input_domain(target, name, source.text())?,
-                });
+                sources.add_to_input_domain(target, name, source.text())?;
             }
         }
-        child_inputs.push(LoadedProjectInput {
-            name: input.name.clone(),
-            locator: input.locator.clone(),
-            domain: target,
-            files,
-        });
     }
     for (alias, grandchild) in &child.children {
         graft_child(sources, domain, alias, grandchild, budget, grafts)?;
-    }
-    let mut main_sources = SourceSet::new();
-    main_sources.add(child.main_source().name(), child.main_source().text())?;
-    let parsed =
-        syrox_lang::parse_sources(&main_sources).map_err(|errors| CheckFailure::Diagnostics {
-            input: main_sources,
-            errors,
-        })?;
-    if let Some(generated) = generated_exports(
-        sources,
-        parsed.iter().next().expect("parsed main").program(),
-        &child_inputs,
-    )? {
-        budget.reserve_source()?;
-        budget.reserve_bytes(generated.len())?;
-        sources.add_to_project_domain(
-            domain,
-            format!("<locked-catalog-exports:{alias}>"),
-            generated,
-        )?;
     }
     Ok(())
 }

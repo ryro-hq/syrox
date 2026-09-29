@@ -1,5 +1,5 @@
 use super::{
-    BTreeMap, BTreeSet, CanonicalItemIdentity, Checker, Elaboration, ItemId, LocalId, ModuleId,
+    BTreeMap, BTreeSet, CanonicalItemIdentity, Checker, Context, Elaboration, ItemId, LocalId,
     Path, Primitive, RawTy, ResolvedItem, ResolvedItemKind, ResolvedTarget, Span, Ty, Type,
     TypeKind,
 };
@@ -327,8 +327,27 @@ impl Checker<'_> {
         )
     }
 
-    pub(super) fn project(&mut self, ty: &Ty, field: &str, span: Span) -> Ty {
-        self.fields_of(ty)
+    pub(super) fn project(&mut self, ty: &Ty, field: &str, context: Context, span: Span) -> Ty {
+        if let Some(info) = nominal_head(ty).and_then(|item| self.structs.get(&item))
+            && !self.has_representation_authority(ty, info, context)
+        {
+            self.error(
+                "opaque struct fields are private in this source domain",
+                span,
+            );
+            return Ty::Error;
+        }
+        let declaration = nominal_head(ty)
+            .and_then(|id| self.structs.get(&id))
+            .and_then(|info| {
+                info.declaration
+                    .fields
+                    .iter()
+                    .find(|candidate| candidate.name.text == field)
+            })
+            .map(|field| field.name.span);
+        let found = self
+            .fields_of(ty)
             .into_iter()
             .find(|(name, _)| name == field)
             .map_or_else(
@@ -337,7 +356,11 @@ impl Checker<'_> {
                     Ty::Error
                 },
                 |(_, ty)| ty,
-            )
+            );
+        if let Some(declaration) = declaration {
+            self.record_field(span, declaration, &found);
+        }
+        found
     }
 
     pub(super) fn fields_of(&mut self, ty: &Ty) -> Vec<(String, Ty)> {
@@ -448,7 +471,11 @@ impl Checker<'_> {
     pub(super) fn expect_same(&mut self, want: &Ty, got: &Ty, span: Span, position: &str) {
         if !want.compatible(got) {
             self.error(
-                format!("{position} type mismatch: expected {want:?}, found {got:?}"),
+                format!(
+                    "{position} type mismatch: expected {}, found {}",
+                    self.program.display_type(want),
+                    self.program.display_type(got)
+                ),
                 span,
             );
         }
@@ -471,6 +498,10 @@ impl Checker<'_> {
         let mut work = self.work;
         while let Some(node) = pending.pop() {
             work = work.saturating_add(1);
+            self.observe_effect(
+                span,
+                super::bodies::EffectOperation::WorkProbe(work.saturating_sub(self.work)),
+            );
             if work > self.limits.max_work || self.exhausted {
                 if !self.exhausted {
                     self.exhausted = true;
@@ -528,6 +559,9 @@ impl Checker<'_> {
         }
         match ty {
             Ty::Specialization { arguments, .. } => {
+                if !ty_contains_parameter(ty) {
+                    self.observe_instance(span, ty);
+                }
                 if !ty_contains_parameter(ty) && !self.generic_instances.contains(ty) {
                     if self.generic_instances.len() >= self.limits.max_generic_instances {
                         if !self.exhausted {
@@ -537,6 +571,9 @@ impl Checker<'_> {
                         return;
                     }
                     self.generic_instances.insert(ty.clone());
+                }
+                if self.body.active && !ty_contains_parameter(ty) {
+                    self.body.instances.insert(ty.clone());
                 }
                 for argument in arguments {
                     self.track_generic_instances(argument, span);
@@ -572,27 +609,6 @@ impl Checker<'_> {
             self.error("unknown enum variant", span);
         }
         exists
-    }
-
-    pub(super) fn module_is_descendant(&self, module: ModuleId, ancestor: ModuleId) -> bool {
-        let module = self
-            .program
-            .modules()
-            .find(|candidate| candidate.id() == module);
-        let ancestor = self
-            .program
-            .modules()
-            .find(|candidate| candidate.id() == ancestor);
-        match (module, ancestor) {
-            (Some(module), Some(ancestor)) => {
-                module.domain() == ancestor.domain()
-                    && module
-                        .path()
-                        .segments()
-                        .starts_with(ancestor.path().segments())
-            }
-            _ => false,
-        }
     }
 
     pub(super) fn item_kind(&self, item: ItemId) -> Option<ResolvedItemKind> {

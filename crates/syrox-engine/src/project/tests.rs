@@ -20,8 +20,10 @@ use super::loader::{
 use super::*;
 use crate::linux_fd::OpenError;
 
+mod editor;
 mod evaluation;
 mod package_set;
+mod recipe_ref;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -1296,176 +1298,106 @@ fn removing_a_child_refuses_a_symlinked_graph_lock_without_mutating_the_parent()
 
 #[test]
 fn descriptor_pinned_child_snapshot_resolves_its_own_modules() {
-    let child = TempProject::new();
-    child.write("main.srx", "inputs { recipes = \"modules:recipes\"; } pub type X = recipes::hello::X; pub fn get() -> X { recipes::hello::make() }");
-    child.write(
-        "recipes/hello.srx",
+    let workspace = TempProject::new();
+    workspace.write("child/main.srx", "inputs { recipes = \"modules:recipes\"; } pub type X = recipes::hello::X; pub fn get() -> X { recipes::hello::make() }");
+    workspace.write(
+        "child/recipes/hello.srx",
         "pub struct X {} pub fn make() -> X { X {} }",
     );
-    lock_project_with(&child.0, &CheckConfiguration::default()).unwrap();
-    let mut sources = SourceSet::new();
-    sources
-        .add(
-            "consumer/main.srx",
-            "inputs { pkgs = \"path:../pkgs\"; } outputs { selected: pkgs::X = pkgs::get(); }",
-        )
+    workspace.write(
+        "consumer/main.srx",
+        "inputs { pkgs = \"path:../child\"; } outputs { selected: pkgs::X = pkgs::get(); }",
+    );
+    let child = workspace.0.join("child");
+    let consumer = workspace.0.join("consumer");
+    let config = CheckConfiguration::default();
+    lock_project_with(&child, &config).unwrap();
+    lock_project_with(&consumer, &config).unwrap();
+    let loaded = loader::load_project_linux(&consumer, &config).unwrap();
+    let domain = loaded
+        .sources()
+        .child_project_domain(SourceDomainId::project(), "pkgs")
         .unwrap();
-    let mut budget = LoadBudget::new(ProjectLimits::default());
-    let mut directories = HashMap::new();
-    let mut files = HashMap::new();
-    let (domain, inputs) = loader::load_child_project_snapshot(
-        &mut sources,
-        SourceDomainId::project(),
-        "pkgs",
-        &child.0,
-        &mut loader::ChildSnapshotAdmission {
-            configuration: &CheckConfiguration::default(),
-            directory_identities: &mut directories,
-            file_identities: &mut files,
-            budget: &mut budget,
-        },
-    )
-    .unwrap();
     assert_ne!(domain, SourceDomainId::project());
-    assert_eq!(inputs.len(), 1);
-    assert_eq!(inputs[0].files().count(), 1);
-    let policy = CheckPolicy::default();
-    let checked = syrox_lang::check(
-        syrox_lang::resolve(syrox_lang::parse_sources(&sources).unwrap()).unwrap(),
-        &policy,
-    )
-    .unwrap();
-    let realized =
-        syrox_lang::evaluate(&checked, &policy, &EvaluationEnvironment::new(&policy)).unwrap();
-    assert!(realized.is_success());
-    assert_eq!(realized.roots().count(), 1);
+    assert_eq!(loaded.children.len(), 1);
+    assert_eq!(
+        plan_project_with(&consumer, &config).unwrap().roots().len(),
+        1
+    );
 }
 
 #[test]
 fn child_snapshot_refuses_a_symlinked_source_before_granting_a_domain() {
-    let child = TempProject::new();
-    child.write("main.srx", "inputs { recipes = \"modules:recipes\"; }");
-    child.write("recipes/hello.srx", "pub struct X {}");
-    let target = child.0.join("recipes/hello.srx");
-    fs::rename(&target, child.0.join("real.srx")).unwrap();
-    symlink(child.0.join("real.srx"), &target).unwrap();
-    let mut sources = SourceSet::new();
-    let mut directories = HashMap::new();
-    let mut files = HashMap::new();
-    let mut budget = LoadBudget::new(ProjectLimits::default());
-    let result = loader::load_child_project_snapshot(
-        &mut sources,
-        SourceDomainId::project(),
-        "pkgs",
-        &child.0,
-        &mut loader::ChildSnapshotAdmission {
-            configuration: &CheckConfiguration::default(),
-            directory_identities: &mut directories,
-            file_identities: &mut files,
-            budget: &mut budget,
-        },
+    let workspace = TempProject::new();
+    workspace.write(
+        "child/main.srx",
+        "inputs { recipes = \"modules:recipes\"; }",
+    );
+    workspace.write("child/recipes/hello.srx", "pub struct X {}");
+    workspace.write("consumer/main.srx", "inputs { pkgs = \"path:../child\"; }");
+    let target = workspace.0.join("child/recipes/hello.srx");
+    fs::rename(&target, workspace.0.join("child/real.srx")).unwrap();
+    symlink(workspace.0.join("child/real.srx"), &target).unwrap();
+    let result = loader::load_project_linux(
+        &workspace.0.join("consumer"),
+        &CheckConfiguration::default(),
     );
     assert!(matches!(result, Err(CheckFailure::SymbolicLink { .. })));
-    assert!(sources.is_empty());
 }
 
 #[test]
-fn child_catalog_snapshot_exports_a_package_to_its_consumer() {
-    let child = TempProject::new();
-    child.write("main.srx", "inputs { catalog = \"modules:recipes\"; } outputs { catalog: std::Catalog = std::Catalog { input = \"catalog\"; }; }");
-    child.write(
-        "recipes/hello.srx",
+fn child_package_set_exports_a_package_to_its_consumer() {
+    let workspace = TempProject::new();
+    workspace.write("child/main.srx", r#"inputs { catalog = "modules:recipes"; }
+        outputs { packages: std::Result<std::PackageSet<std::Package>, std::MapKey> =
+            std::package_set(module_exports(catalog, hello, std::MapEntry::Entry<fn() -> std::Package>)); }"#);
+    workspace.write(
+        "child/recipes/hello.srx",
         "pub fn hello() -> std::Package { std::Package { id = \"hello\"; dependencies = []; } }",
     );
+    workspace.write(
+        "consumer/main.srx",
+        r#"inputs { pkgs = "path:../child"; }
+           fn missing() -> std::Package { missing() }
+           outputs { hello: std::Package = match pkgs::packages {
+               Ok(set) => match std::package_get(set, "hello") {
+                   Some(package) => package, None => missing(),
+               }, Err(_) => missing(),
+           }; }"#,
+    );
     let configuration = package_configuration();
-    lock_project_with(&child.0, &configuration).unwrap();
-    let mut sources = SourceSet::new();
-    sources
-        .add(
-            "consumer/main.srx",
-            "inputs { pkgs = \"path:../pkgs\"; } outputs { hello: std::Package = pkgs::hello; }",
-        )
-        .unwrap();
-    let mut directories = HashMap::new();
-    let mut files = HashMap::new();
-    let mut budget = LoadBudget::new(ProjectLimits::default());
-    loader::load_child_project_snapshot(
-        &mut sources,
-        SourceDomainId::project(),
-        "pkgs",
-        &child.0,
-        &mut loader::ChildSnapshotAdmission {
-            configuration: &configuration,
-            directory_identities: &mut directories,
-            file_identities: &mut files,
-            budget: &mut budget,
-        },
-    )
-    .unwrap();
-    for source in configuration.standard_library.as_ref().unwrap().sources() {
-        sources
-            .add_standard_library(source.name(), source.text())
-            .unwrap();
-    }
-    let policy = CheckPolicy::default();
-    let checked = syrox_lang::check(
-        syrox_lang::resolve(syrox_lang::parse_sources(&sources).unwrap()).unwrap(),
-        &policy,
-    )
-    .unwrap();
-    let realized =
-        syrox_lang::evaluate(&checked, &policy, &EvaluationEnvironment::new(&policy)).unwrap();
-    assert!(realized.is_success());
-    assert_eq!(realized.roots().count(), 1);
+    let consumer = workspace.0.join("consumer");
+    lock_project_with(&workspace.0.join("child"), &configuration).unwrap();
+    lock_project_with(&consumer, &configuration).unwrap();
+    let plan = plan_project_with(&consumer, &configuration).unwrap();
+    assert_eq!(plan.packages().next().unwrap().export(), Some("hello"));
 }
 
 #[test]
 fn child_snapshot_requires_its_own_current_lock_before_exposing_sources() {
-    let child = TempProject::new();
-    child.write("main.srx", "inputs { dep = \"path:dep\"; }");
-    child.write("dep/one.srx", "pub struct One {}");
-    let load = || {
-        let mut sources = SourceSet::new();
-        let mut directories = HashMap::new();
-        let mut files = HashMap::new();
-        let mut budget = LoadBudget::new(ProjectLimits::default());
-        let result = loader::load_child_project_snapshot(
-            &mut sources,
-            SourceDomainId::project(),
-            "child",
-            &child.0,
-            &mut loader::ChildSnapshotAdmission {
-                configuration: &CheckConfiguration::default(),
-                directory_identities: &mut directories,
-                file_identities: &mut files,
-                budget: &mut budget,
-            },
-        );
-        (result.map(|_| ()), sources)
-    };
-    let (missing, sources) = load();
+    let workspace = TempProject::new();
+    workspace.write("child/main.srx", "inputs { dep = \"path:dep\"; }");
+    workspace.write("child/dep/one.srx", "pub struct One {}");
+    workspace.write("consumer/main.srx", "inputs { child = \"path:../child\"; }");
+    let child = workspace.0.join("child");
+    let consumer = workspace.0.join("consumer");
+    let load = || loader::load_project_linux(&consumer, &CheckConfiguration::default());
+    let missing = load();
     assert!(matches!(
         missing,
         Err(CheckFailure::MissingChildLock { .. })
     ));
-    assert!(sources.is_empty());
 
-    lock_project_with(&child.0, &CheckConfiguration::default()).unwrap();
-    assert!(load().0.is_ok());
-    child.write("dep/two.srx", "pub struct Two {}");
-    let (drift, sources) = load();
+    lock_project_with(&child, &CheckConfiguration::default()).unwrap();
+    assert!(load().is_ok());
+    workspace.write("child/dep/two.srx", "pub struct Two {}");
+    let drift = load();
     assert!(matches!(drift, Err(CheckFailure::InvalidChildLock { .. })));
-    assert!(sources.is_empty());
 
-    fs::remove_file(child.0.join(crate::LOCK_FILE_NAME)).unwrap();
-    symlink(
-        child.0.join("main.srx"),
-        child.0.join(crate::LOCK_FILE_NAME),
-    )
-    .unwrap();
-    let (linked, sources) = load();
+    fs::remove_file(child.join(crate::LOCK_FILE_NAME)).unwrap();
+    symlink(child.join("main.srx"), child.join(crate::LOCK_FILE_NAME)).unwrap();
+    let linked = load();
     assert!(matches!(linked, Err(CheckFailure::InvalidChildLock { .. })));
-    assert!(sources.is_empty());
 }
 
 #[test]
@@ -1498,13 +1430,13 @@ fn locked_catalog_discovers_factories_across_files_and_requires_relock_on_additi
     project.write(
         "main.srx",
         r#"inputs { catalog = "modules:recipes"; }
-        outputs { catalog: std::Catalog = std::Catalog { input = "catalog"; }; }"#,
+         outputs { packages: std::Result<std::PackageSet<std::Package>, std::MapKey> =
+             std::package_set(module_exports(catalog, recipe, std::MapEntry::Entry<fn() -> std::Package>)); }"#,
     );
     project.write(
         "recipes/hello.srx",
         r#"
-        fn hello() -> std::Package { std::Package { id = "hello"; dependencies = []; } }
-        outputs { hello: fn() -> std::Package = hello; }
+        pub fn recipe() -> std::Package { std::Package { id = "hello"; dependencies = []; } }
     "#,
     );
     let configuration = package_configuration();
@@ -1519,8 +1451,7 @@ fn locked_catalog_discovers_factories_across_files_and_requires_relock_on_additi
     project.write(
         "recipes/glibc.srx",
         r#"
-        fn glibc() -> std::Package { std::Package { id = "glibc"; dependencies = []; } }
-        outputs { glibc: fn() -> std::Package = glibc; }
+        pub fn recipe() -> std::Package { std::Package { id = "glibc"; dependencies = []; } }
     "#,
     );
     assert!(matches!(
@@ -1540,59 +1471,18 @@ fn locked_catalog_discovers_factories_across_files_and_requires_relock_on_additi
 }
 
 #[test]
-fn catalog_projection_rejects_conflicting_factories_across_files() {
-    let project = TempProject::new();
-    project.write(
-        "main.srx",
-        r#"inputs { catalog = "modules:recipes"; }
-        outputs { catalog: std::Catalog = std::Catalog { input = "catalog"; }; }"#,
-    );
-    let factory = r#"
-        fn hello() -> std::Package { std::Package { id = "hello"; dependencies = []; } }
-        outputs { hello: fn() -> std::Package = hello; }
-    "#;
-    project.write("recipes/one.srx", factory);
-    project.write("recipes/two.srx", factory);
-    assert!(matches!(
-        check_project_with(&project.0, &package_configuration()),
-        Err(CheckFailure::InvalidCatalog { reason }) if reason.contains("duplicate factory export")
-    ));
-}
-
-#[test]
-fn catalog_projection_rejects_conflict_with_explicit_root_export() {
-    let project = TempProject::new();
-    project.write(
-        "main.srx",
-        r#"inputs { catalog = "modules:recipes"; }
-        outputs {
-            catalog: std::Catalog = std::Catalog { input = "catalog"; };
-            hello: std::Package = std::Package { id = "hello"; dependencies = []; };
-        }"#,
-    );
-    project.write(
-        "recipes/hello.srx",
-        r#"fn hello() -> std::Package { std::Package { id = "hello"; dependencies = []; } }
-           outputs { hello: fn() -> std::Package = hello; }"#,
-    );
-    assert!(matches!(
-        check_project_with(&project.0, &package_configuration()),
-        Err(CheckFailure::Diagnostics { errors, .. })
-            if errors.iter().any(|error| error.message.contains("duplicate"))
-    ));
-}
-
-#[test]
 fn single_composite_recipe_exports_package_source_and_build() {
     let project = TempProject::new();
     project.write(
         "main.srx",
         r#"inputs { catalog = "modules:recipes"; }
-        outputs { catalog: std::Catalog = std::Catalog { input = "catalog"; }; }"#,
+         outputs { packages: std::Result<std::PackageSet<std::Recipe<std::GlibcBuild>>, std::MapKey> =
+             std::package_set(module_exports(catalog, recipe,
+                 std::MapEntry::Entry<fn() -> std::Recipe<std::GlibcBuild>>)); }"#,
     );
     project.write(
         "recipes/glibc.srx",
-        r#"fn recipe() -> std::Recipe<std::GlibcBuild> {
+        r#"pub fn recipe() -> std::Recipe<std::GlibcBuild> {
             std::Recipe<std::GlibcBuild> {
                 package = std::Package { id = "glibc"; dependencies = []; };
                 acquisition = std::Acquisition {
@@ -1611,7 +1501,7 @@ fn single_composite_recipe_exports_package_source_and_build() {
                 };
             }
         }
-        outputs { glibc: fn() -> std::Recipe<std::GlibcBuild> = recipe; }"#,
+        "#,
     );
     let configuration = package_configuration();
     lock_project_with(&project.0, &configuration).unwrap();
@@ -1631,7 +1521,8 @@ fn public_factory_needs_no_repeated_output_signature() {
     project.write(
         "main.srx",
         r#"inputs { catalog = "modules:recipes"; }
-        outputs { catalog: std::Catalog = std::Catalog { input = "catalog"; }; }"#,
+         outputs { packages: std::Result<std::PackageSet<std::Package>, std::MapKey> =
+             std::package_set(module_exports(catalog, hello, std::MapEntry::Entry<fn() -> std::Package>)); }"#,
     );
     project.write(
         "recipes/hello.srx",
@@ -1664,7 +1555,8 @@ fn catalog_files_have_distinct_modules_and_package_entrypoints() {
     project.write(
         "main.srx",
         r#"inputs { catalog = "modules:recipes"; }
-        outputs { catalog: std::Catalog = std::Catalog { input = "catalog"; }; }"#,
+         outputs { packages: std::Result<std::PackageSet<std::Package>, std::MapKey> =
+             std::package_set(module_exports(catalog, recipe, std::MapEntry::Entry<fn() -> std::Package>)); }"#,
     );
     project.write(
         "recipes/hello/package.srx",
@@ -1691,7 +1583,8 @@ fn catalog_files_have_distinct_modules_and_package_entrypoints() {
         "main.srx",
         r#"inputs { catalog = "modules:recipes"; }
         outputs {
-            catalog: std::Catalog = std::Catalog { input = "catalog"; };
+            packages: std::Result<std::PackageSet<std::Package>, std::MapKey> =
+                std::package_set(module_exports(catalog, recipe, std::MapEntry::Entry<fn() -> std::Package>));
             private: std::Package = catalog::hello::make();
         }"#,
     );
@@ -1706,7 +1599,7 @@ fn catalog_files_have_distinct_modules_and_package_entrypoints() {
         "pub fn extra() -> std::Package { std::Package { id = \"extra\"; dependencies = []; } }",
     );
     assert!(matches!(check_project_with(&project.0, &configuration),
-        Err(CheckFailure::InvalidCatalog { reason }) if reason.contains("share one recipe module")));
+        Err(CheckFailure::InvalidModuleInput { reason }) if reason.contains("share one recipe module")));
 }
 
 #[test]
@@ -2223,7 +2116,7 @@ fn failed_root_without_diagnostic_capacity_is_still_an_evaluation_failure() {
     );
     let mut configuration = CheckConfiguration::default();
     configuration.evaluation_limits.max_diagnostics = 0;
-    let error = check_file_with(&project.0.join("main.srx"), &configuration).unwrap_err();
+    let error = check_path_with(&project.0.join("main.srx"), &configuration).unwrap_err();
     let CheckFailure::Evaluation {
         errors,
         failed_roots,
@@ -2242,7 +2135,7 @@ fn evaluation_setup_failure_is_structured() {
     project.write("main.srx", "value V(int); outputs { out: V = 1; }");
     let mut configuration = CheckConfiguration::default();
     configuration.evaluation_limits.max_setup_steps = 0;
-    let error = check_file_with(&project.0.join("main.srx"), &configuration).unwrap_err();
+    let error = check_path_with(&project.0.join("main.srx"), &configuration).unwrap_err();
     assert!(matches!(
         error,
         CheckFailure::EvaluationSetup {
@@ -2990,10 +2883,10 @@ fn authenticated_input_factory_flows_through_lock_check_and_plan() {
     project.write(
         "catalog/package.srx",
         r#"
-        fn zlib() -> std::Package {
+        fn make_zlib() -> std::Package {
             std::Package { id = "zlib"; dependencies = []; }
         }
-        outputs { zlib: fn() -> std::Package = zlib; }
+        outputs { zlib: fn() -> std::Package = make_zlib; }
         "#,
     );
     let configuration = package_configuration();

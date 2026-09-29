@@ -18,6 +18,10 @@ use crate::{
     StringLiteral, StringPart, Ty,
 };
 
+mod memo;
+pub(super) use memo::MemoArena;
+pub use memo::MemoId;
+
 #[derive(Clone)]
 struct OpenScope {
     name: Option<Arc<str>>,
@@ -26,6 +30,11 @@ struct OpenScope {
 
 pub(super) struct Halt;
 pub(super) type Eval<T> = Result<T, Halt>;
+
+pub(super) struct CachedOutput {
+    value: Value,
+    shareable: bool,
+}
 
 // Calls use several evaluator frames per expression. Fold releases each call
 // before the next item, independently of this native-stack protection.
@@ -42,9 +51,13 @@ pub(super) struct Evaluator<'a> {
     pub(super) diagnostics: Vec<Diagnostic>,
     locals: BTreeMap<LocalId, Value>,
     active_outputs: BTreeSet<ItemId>,
-    memo_outputs: BTreeMap<ItemId, Value>,
+    memo_outputs: BTreeMap<ItemId, CachedOutput>,
+    pub(super) memos: MemoArena,
     scopes: Vec<OpenScope>,
     pub(super) claims: BTreeMap<ResourceClaimKey, Span>,
+    // Includes reads of root-scoped cached outputs, whose claims were already
+    // recorded. A reusable payload alone does not imply a pure computation.
+    claim_effects: usize,
     pub(super) canonical_types: BTreeMap<Ty, Arc<CanonicalType>>,
     next_boundary: u64,
     pub(super) steps: usize,
@@ -73,16 +86,15 @@ impl<'a> Evaluator<'a> {
         previous
     }
 
-    pub(super) fn inherit_outputs(&mut self, outputs: BTreeMap<ItemId, Value>) {
+    pub(super) fn inherit_outputs(&mut self, outputs: BTreeMap<ItemId, CachedOutput>) {
         self.memo_outputs = outputs;
     }
 
-    pub(super) fn take_shareable_outputs(&mut self, succeeded: bool) -> BTreeMap<ItemId, Value> {
-        if succeeded && self.diagnostics.is_empty() && self.claims.is_empty() {
-            std::mem::take(&mut self.memo_outputs)
-        } else {
-            BTreeMap::new()
-        }
+    pub(super) fn take_shareable_outputs(&mut self) -> BTreeMap<ItemId, CachedOutput> {
+        // A later sibling failure or claim cannot change an already completed
+        // claim-free value. Retaining it also preserves lazy instance identity.
+        self.memo_outputs.retain(|_, output| output.shareable);
+        std::mem::take(&mut self.memo_outputs)
     }
 
     pub(super) fn new(
@@ -109,12 +121,14 @@ impl<'a> Evaluator<'a> {
             locals: BTreeMap::new(),
             active_outputs: BTreeSet::new(),
             memo_outputs: BTreeMap::new(),
+            memos: MemoArena::default(),
             scopes: if scopes_fit {
                 Vec::with_capacity(scope_count)
             } else {
                 Vec::new()
             },
             claims: BTreeMap::new(),
+            claim_effects: 0,
             canonical_types: BTreeMap::new(),
             next_boundary: 0,
             steps: 0,
@@ -191,7 +205,9 @@ impl<'a> Evaluator<'a> {
 
     pub(super) fn error(&mut self, span: Span, message: impl Into<String>) {
         if self.diagnostics.len() < self.limits.max_diagnostics {
-            self.diagnostics.push(Diagnostic::error(message, span));
+            self.diagnostics.push(
+                Diagnostic::error(message, span).with_code(crate::DiagnosticCode::Evaluation),
+            );
         }
     }
 
@@ -318,6 +334,10 @@ impl<'a> Evaluator<'a> {
             ExpressionKind::ModuleExports { mapper, .. } => {
                 self.module_exports(mapper, substitutions, expression.span)
             }
+            ExpressionKind::Memoize(value) => {
+                let callable = self.expression(value, substitutions)?;
+                self.memoize(callable, expression.span)
+            }
             ExpressionKind::Compare {
                 left,
                 right,
@@ -404,7 +424,12 @@ impl<'a> Evaluator<'a> {
                     captures,
                 })
             }
-            ExpressionKind::Struct { fields, .. } => {
+            ExpressionKind::Struct {
+                fields, recovery, ..
+            } => {
+                if !recovery.is_empty() {
+                    return self.fail(expression.span, "recovered struct cannot be evaluated");
+                }
                 let checked_ty =
                     self.substitute_ty(metadata.ty(), substitutions, expression.span)?;
                 let item = nominal_head(&checked_ty).ok_or_else(|| {
@@ -487,21 +512,31 @@ impl<'a> Evaluator<'a> {
         }
         self.expand(size_of::<ItemId>(), expression.span)?;
         self.active_outputs.insert(item);
+        let claim_effects = self.claim_effects;
         let result = self.expression(expression, &BTreeMap::new());
         self.active_outputs.remove(&item);
         let value = result?;
-        if !value.affine() && self.claims.is_empty() && self.diagnostics.is_empty() {
-            self.expand(size_of::<(ItemId, Value)>(), expression.span)?;
+        if !value.affine() && self.claim_effects == claim_effects && self.diagnostics.is_empty() {
+            self.expand(size_of::<(ItemId, CachedOutput)>(), expression.span)?;
             let copy = Self::copy_value_ref(self, &value, expression.span, 0)?;
-            self.memo_outputs.insert(item, copy);
+            self.memo_outputs.insert(
+                item,
+                CachedOutput {
+                    value: copy,
+                    shareable: true,
+                },
+            );
         }
         Ok(value)
     }
 
     fn output_value(&mut self, item: ItemId, span: Span) -> Eval<Value> {
-        if let Some(value) = self.memo_outputs.remove(&item) {
-            let result = Self::copy_value_ref(self, &value, span, 0);
-            self.memo_outputs.insert(item, value);
+        if let Some(output) = self.memo_outputs.remove(&item) {
+            if !output.shareable {
+                self.claim_effects = self.claim_effects.saturating_add(1);
+            }
+            let result = Self::copy_value_ref(self, &output.value, span, 0);
+            self.memo_outputs.insert(item, output);
             return result;
         }
         if self.active_outputs.contains(&item) {
@@ -511,6 +546,7 @@ impl<'a> Evaluator<'a> {
         self.active_outputs.insert(item);
         let value = self.index.output_values.get(&item).copied().ok_or(Halt)?;
         let previous = self.enter_project_context(value.span);
+        let claim_effects = self.claim_effects;
         let result = self.expression(value, &BTreeMap::new());
         self.project_context = previous;
         self.active_outputs.remove(&item);
@@ -521,9 +557,12 @@ impl<'a> Evaluator<'a> {
                 "imported value output cannot carry an affine resource",
             );
         }
-        self.expand(size_of::<(ItemId, Value)>(), span)?;
+        self.expand(size_of::<(ItemId, CachedOutput)>(), span)?;
         let copy = Self::copy_value_ref(self, &value, span, 0);
-        self.memo_outputs.insert(item, value);
+        let shareable =
+            copy.is_ok() && self.claim_effects == claim_effects && self.diagnostics.is_empty();
+        self.memo_outputs
+            .insert(item, CachedOutput { value, shareable });
         copy
     }
 
@@ -540,6 +579,10 @@ impl<'a> Evaluator<'a> {
                 let ty = self.checked.expression(span).ok_or(Halt)?.ty();
                 let ty = self.canonical_ty(ty, substitutions, span)?;
                 return self.construct_variant(ty, index, payload, span);
+            }
+            Some(ResolvedTarget::Item(item)) if self.index.output_values.contains_key(&item) => {
+                let callable = self.output_value(item, callee_span)?;
+                return self.call_value(callable, callee_span, arguments, substitutions, span);
             }
             Some(ResolvedTarget::Item(item)) => item,
             Some(ResolvedTarget::Local(local)) => {
@@ -588,6 +631,12 @@ impl<'a> Evaluator<'a> {
 
     fn invoke_value(&mut self, callable: Value, values: Vec<Value>, span: Span) -> Eval<Value> {
         match callable {
+            Value::MemoizedFunction { id, .. } => {
+                if !values.is_empty() {
+                    return self.fail(span, "memoized function received arguments");
+                }
+                self.force_memo(&id, span)
+            }
             Value::VariantConstructor { ty, index } => {
                 let CanonicalType::Function {
                     parameters, result, ..
@@ -734,7 +783,11 @@ impl<'a> Evaluator<'a> {
             for statement in &block.statements {
                 self.tick(statement.span)?;
                 match &statement.kind {
-                    StatementKind::Let { name, value } => {
+                    StatementKind::Recovery { .. } => {
+                        return self
+                            .fail(statement.span, "recovered statement cannot be evaluated");
+                    }
+                    StatementKind::Let { name, value, .. } => {
                         let value = self.expression(value, substitutions)?;
                         let Some(local) = self.index.local(name.span) else {
                             return self.fail(name.span, "missing checked let identity");
@@ -790,6 +843,10 @@ impl<'a> Evaluator<'a> {
         }
         ev.expand(size_of::<Value>(), span)?;
         match value {
+            Value::MemoizedFunction { ty, id } => Ok(Value::MemoizedFunction {
+                ty: ty.clone(),
+                id: id.clone(),
+            }),
             Value::VariantConstructor { ty, index } => Ok(Value::VariantConstructor {
                 ty: ty.clone(),
                 index: *index,
@@ -1043,6 +1100,7 @@ impl<'a> Evaluator<'a> {
                 return Err(Halt);
             }
             self.claims.insert(key, span);
+            self.claim_effects = self.claim_effects.saturating_add(1);
         }
         Ok(Value::Nominal {
             ty,

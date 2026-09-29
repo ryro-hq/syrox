@@ -51,6 +51,14 @@ impl<'a> Checker<'a> {
     }
 
     pub(super) fn charge(&mut self, span: Span) -> bool {
+        self.observe_effect(span, super::bodies::EffectOperation::WorkProbe(1));
+        if self
+            .cancellation
+            .is_some_and(|cancellation| cancellation.check().is_err())
+        {
+            self.exhausted = true;
+            return false;
+        }
         if self.exhausted {
             return false;
         }
@@ -68,16 +76,21 @@ impl<'a> Checker<'a> {
     }
 
     pub(super) fn push_diagnostic(&mut self, diagnostic: Diagnostic) {
-        if self.diagnostics.len() < MAX_DIAGNOSTICS {
-            self.diagnostics.push(diagnostic);
+        self.observe_effect(diagnostic.span, super::bodies::EffectOperation::Diagnostic);
+        self.body.fact_errors = self.body.fact_errors.saturating_add(1);
+        if self.prior_diagnostics + self.diagnostics.len() < MAX_DIAGNOSTICS {
+            self.diagnostics
+                .push(diagnostic.in_phase(crate::DiagnosticCode::TypeCheck));
         }
     }
 
     pub(super) fn reserve_metadata(&mut self, span: Span) -> bool {
+        self.observe_effect(span, super::bodies::EffectOperation::Metadata);
         if self
             .expressions
             .len()
             .saturating_add(self.patterns.len())
+            .saturating_add(self.prior_metadata)
             .saturating_add(self.collection_metadata_units)
             >= self.limits.max_metadata_units
         {

@@ -248,8 +248,7 @@ impl Resolver<'_> {
                         }
                         let name = match &output.kind {
                             crate::OutputKind::Value { name, .. }
-                            | crate::OutputKind::Type { name, .. }
-                            | crate::OutputKind::Function { name, .. } => &name.text,
+                            | crate::OutputKind::Type { name, .. } => &name.text,
                         };
                         if !names.insert(name.clone()) {
                             self.error("duplicate output name", output.span);
@@ -369,12 +368,6 @@ impl Resolver<'_> {
                         };
                         (&name.text, path, Expected::Type, ReferenceKind::Type)
                     }
-                    crate::OutputKind::Function { name, function, .. } => (
-                        &name.text,
-                        function,
-                        Expected::Function,
-                        ReferenceKind::Function,
-                    ),
                 };
                 if self.module_info[module.index()].exports.contains_key(name) {
                     if report_missing && self.public_imports.contains(&(module, name.clone())) {
@@ -471,7 +464,7 @@ impl Resolver<'_> {
     }
 }
 
-fn declaration(item: &Item) -> Option<(&str, ResolvedItemKind, Span)> {
+pub(super) fn declaration(item: &Item) -> Option<(&str, ResolvedItemKind, Span)> {
     match &item.kind {
         ItemKind::TypeAlias(declaration) => Some((
             &declaration.name.text,

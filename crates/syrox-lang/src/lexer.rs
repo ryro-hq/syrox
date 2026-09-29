@@ -1,7 +1,12 @@
 use crate::{Diagnostic, MAX_DIAGNOSTICS, MAX_TOKENS, Source, SourceId, Span};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TokenKind {
+pub enum TokenKind {
+    Whitespace,
+    Comment,
+    Invalid,
+    /// Unscanned suffix after a lexer budget was exhausted.
+    Unparsed,
     Ident,
     String,
     Integer,
@@ -28,7 +33,7 @@ pub(crate) enum TokenKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Keyword {
+pub enum Keyword {
     Compare,
     Enum,
     Erase,
@@ -41,6 +46,7 @@ pub(crate) enum Keyword {
     Match,
     Mod,
     ModuleExports,
+    Memoize,
     Opaque,
     Once,
     Outputs,
@@ -57,36 +63,95 @@ pub(crate) enum Keyword {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Token {
+pub struct Token {
     pub kind: TokenKind,
     pub span: Span,
 }
 
+impl TokenKind {
+    pub const fn is_trivia(self) -> bool {
+        matches!(self, Self::Whitespace | Self::Comment)
+    }
+}
+
+pub(crate) struct Lexed {
+    pub tokens: Vec<Token>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+pub(crate) fn lex(source_id: SourceId, source: &Source) -> Lexed {
+    lex_cancellable(source_id, source, None).expect("uncancelled lexer")
+}
+
+pub(crate) fn lex_cancellable(
+    source_id: SourceId,
+    source: &Source,
+    cancellation: Option<&crate::AnalysisCancellation>,
+) -> Result<Lexed, crate::AnalysisCancelled> {
+    let mut next_check = 0;
+    let result = lex_with_checkpoint(source_id, source, |at| {
+        if at >= next_check {
+            if let Some(cancel) = cancellation {
+                cancel.check()?;
+            }
+            next_check = at + 1024;
+        }
+        Ok::<_, crate::AnalysisCancelled>(())
+    })?;
+    if let Some(cancel) = cancellation {
+        cancel.check()?;
+    }
+    Ok(result)
+}
+
 #[allow(clippy::too_many_lines)]
-pub(crate) fn lex(source_id: SourceId, source: &Source) -> Result<Vec<Token>, Vec<Diagnostic>> {
+fn lex_with_checkpoint(
+    source_id: SourceId,
+    source: &Source,
+    mut checkpoint: impl FnMut(usize) -> Result<(), crate::AnalysisCancelled>,
+) -> Result<Lexed, crate::AnalysisCancelled> {
     let bytes = source.text().as_bytes();
     let mut tokens = Vec::new();
     let mut errors = Vec::new();
     let mut at = 0;
 
     while at < bytes.len() {
+        checkpoint(at)?;
         let start = at;
+        if tokens.len() == MAX_TOKENS {
+            push_error(
+                &mut errors,
+                Diagnostic::error(
+                    format!("source exceeds the {MAX_TOKENS}-token limit"),
+                    make_span(source_id, start, start, bytes.len()),
+                ),
+            );
+            break;
+        }
         let kind = match bytes[at] {
             b' ' | b'\t' | b'\r' | b'\n' => {
-                at += 1;
-                continue;
+                while bytes
+                    .get(at)
+                    .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+                {
+                    checkpoint(at)?;
+                    at += 1;
+                }
+                TokenKind::Whitespace
             }
             b'/' if bytes.get(at + 1) == Some(&b'/') => {
                 at += 2;
                 while at < bytes.len() && bytes[at] != b'\n' {
+                    checkpoint(at)?;
                     at += 1;
                 }
-                continue;
+                TokenKind::Comment
             }
             b'"' => {
                 at += 1;
                 let mut closed = false;
                 while at < bytes.len() {
+                    checkpoint(at)?;
                     match bytes[at] {
                         b'"' => {
                             at += 1;
@@ -112,6 +177,7 @@ pub(crate) fn lex(source_id: SourceId, source: &Source) -> Result<Vec<Token>, Ve
                                 );
                                 while at < bytes.len() && !matches!(bytes[at], b'"' | b'\r' | b'\n')
                                 {
+                                    checkpoint(at)?;
                                     at += 1;
                                 }
                                 continue;
@@ -148,6 +214,7 @@ pub(crate) fn lex(source_id: SourceId, source: &Source) -> Result<Vec<Token>, Ve
                     .get(at)
                     .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
                 {
+                    checkpoint(at)?;
                     at += 1;
                 }
                 keyword(&source.text()[start..at]).map_or(TokenKind::Ident, TokenKind::Keyword)
@@ -155,6 +222,7 @@ pub(crate) fn lex(source_id: SourceId, source: &Source) -> Result<Vec<Token>, Ve
             byte if byte.is_ascii_digit() => {
                 at += 1;
                 while bytes.get(at).is_some_and(u8::is_ascii_digit) {
+                    checkpoint(at)?;
                     at += 1;
                 }
                 TokenKind::Integer
@@ -194,22 +262,9 @@ pub(crate) fn lex(source_id: SourceId, source: &Source) -> Result<Vec<Token>, Ve
                         make_span(source_id, start, at, bytes.len()),
                     ),
                 );
-                if errors.len() == MAX_DIAGNOSTICS {
-                    break;
-                }
-                continue;
+                TokenKind::Invalid
             }
         };
-        if tokens.len() == MAX_TOKENS {
-            push_error(
-                &mut errors,
-                Diagnostic::error(
-                    format!("source exceeds the {MAX_TOKENS}-token limit"),
-                    make_span(source_id, start, at, bytes.len()),
-                ),
-            );
-            break;
-        }
         tokens.push(Token {
             kind,
             span: make_span(source_id, start, at, bytes.len()),
@@ -219,11 +274,16 @@ pub(crate) fn lex(source_id: SourceId, source: &Source) -> Result<Vec<Token>, Ve
         }
     }
 
-    if errors.is_empty() {
-        Ok(tokens)
-    } else {
-        Err(errors)
+    if at < bytes.len() {
+        tokens.push(Token {
+            kind: TokenKind::Unparsed,
+            span: make_span(source_id, at, bytes.len(), bytes.len()),
+        });
     }
+    Ok(Lexed {
+        tokens,
+        diagnostics: errors,
+    })
 }
 
 fn single(at: &mut usize, kind: TokenKind) -> TokenKind {
@@ -238,7 +298,7 @@ fn double(at: &mut usize, kind: TokenKind) -> TokenKind {
 
 fn push_error(errors: &mut Vec<Diagnostic>, error: Diagnostic) {
     if errors.len() < MAX_DIAGNOSTICS {
-        errors.push(error);
+        errors.push(error.in_phase(crate::DiagnosticCode::Lexical));
     }
 }
 
@@ -250,6 +310,7 @@ fn keyword(word: &str) -> Option<Keyword> {
         "fold" => Keyword::Fold,
         "compare" => Keyword::Compare,
         "module_exports" => Keyword::ModuleExports,
+        "memoize" => Keyword::Memoize,
         "in" => Keyword::In,
         "inputs" => Keyword::Inputs,
         "int" => Keyword::Int,
@@ -283,4 +344,43 @@ fn make_span(source_id: SourceId, start: usize, end: usize, limit: usize) -> Spa
         u32::try_from(start.min(limit)).unwrap_or(u32::MAX),
         u32::try_from(end.min(limit)).unwrap_or(u32::MAX),
     )
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_interrupts_inside_long_tokens_without_publishing_partial_lexing() {
+        for text in [
+            " ".repeat(8192),
+            format!("//{}", "c".repeat(8192)),
+            format!("\"{}\"", "s".repeat(8192)),
+            "name".repeat(2048),
+            "9".repeat(8192),
+            format!("\"\\q{}\"", "x".repeat(8192)),
+        ] {
+            let source = Source::new("buffer.srx", text).unwrap();
+            let mut observed = 0;
+            let cancelled = lex_with_checkpoint(SourceId::SINGLE, &source, |offset| {
+                observed = offset;
+                if offset >= 2048 {
+                    Err(crate::AnalysisCancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(cancelled.is_err());
+            assert_eq!(observed, 2048);
+            let fresh = lex_cancellable(
+                SourceId::SINGLE,
+                &source,
+                Some(&crate::AnalysisCancellation::default()),
+            )
+            .unwrap();
+            let strict = lex(SourceId::SINGLE, &source);
+            assert_eq!(fresh.tokens, strict.tokens);
+            assert_eq!(fresh.diagnostics, strict.diagnostics);
+        }
+    }
 }

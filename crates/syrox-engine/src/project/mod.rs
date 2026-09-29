@@ -1,16 +1,21 @@
 #[cfg(target_os = "linux")]
 mod analyze;
 #[cfg(target_os = "linux")]
-mod catalog;
 #[cfg(target_os = "linux")]
 mod evaluation;
 #[cfg(target_os = "linux")]
 pub use evaluation::{LockedProject, ProjectEvaluation, open_locked_project_with};
+mod editor;
 #[cfg(target_os = "linux")]
 mod loader;
 #[cfg(target_os = "linux")]
 mod locator;
 mod standard_library;
+pub use editor::{
+    ProjectAnalysis, ProjectAnalysisError, ProjectAnalysisLockStatus, ProjectAnalysisSnapshot,
+};
+#[cfg(target_os = "linux")]
+pub use editor::{open_project_analysis_with, open_standard_library_analysis_with};
 
 use std::collections::BTreeMap;
 use std::io;
@@ -243,10 +248,6 @@ impl LoadedProject {
         &self.sources
     }
 
-    pub const fn main_source_id(&self) -> SourceId {
-        self.main_source
-    }
-
     pub fn main_source(&self) -> &Source {
         self.sources
             .get(self.main_source)
@@ -361,8 +362,14 @@ pub enum LockCleanupError {
 
 #[derive(Debug, Error)]
 pub enum ProjectOperationError {
+    #[error(transparent)]
+    Editor(#[from] ProjectAnalysisError),
     #[error("project has no value output `{name}`")]
     MissingOutput { name: String },
+    #[error("catalog package set is invalid: {reason}")]
+    InvalidPackageSet { reason: &'static str },
+    #[error("package set has no entry `{key}`")]
+    MissingPackageReference { key: String },
     #[error(transparent)]
     Check(#[from] CheckFailure),
     #[error("project has no {name}")]
@@ -470,8 +477,8 @@ pub enum CheckFailure {
     UnsafeInputPath { name: String, path: PathBuf },
     #[error("duplicate project input name `{name}`")]
     DuplicateInputName { name: String },
-    #[error("invalid catalog export declaration: {reason}")]
-    InvalidCatalog { reason: String },
+    #[error("invalid modules input: {reason}")]
+    InvalidModuleInput { reason: String },
     #[error("child project {path} has no {name}")]
     MissingChildLock { path: PathBuf, name: &'static str },
     #[error("child project {path} lock could not be verified: {reason}")]
@@ -506,10 +513,6 @@ pub enum CheckFailure {
     },
 }
 
-pub fn check_path(path: &Path) -> Result<CheckReport, CheckFailure> {
-    check_path_with(path, &CheckConfiguration::default())
-}
-
 pub fn check_path_with(
     path: &Path,
     configuration: &CheckConfiguration,
@@ -528,10 +531,6 @@ pub fn check_project_with(
 ) -> Result<CheckReport, CheckFailure> {
     validate_project_limits(configuration.project_limits)?;
     check_project_platform(path, configuration)
-}
-
-pub fn validate_project(path: &Path) -> Result<ValidatedProject, CheckFailure> {
-    validate_project_with(path, &CheckConfiguration::default())
 }
 
 pub fn validate_project_with(
@@ -605,17 +604,29 @@ pub fn plan_project_outputs_with(
     }
 }
 
-/// Compatibility entrypoint for callers that check one source file.
-pub fn check_file(path: &Path) -> Result<CheckReport, CheckFailure> {
-    check_file_with(path, &CheckConfiguration::default())
-}
-
-fn check_file_with(
+/// Plan one catalog key and its providers from a verified snapshot. Projects
+/// without a typed set retain their ordinary complete-Plan lookup behavior.
+pub fn plan_project_package_with(
     path: &Path,
     configuration: &CheckConfiguration,
-) -> Result<CheckReport, CheckFailure> {
-    validate_project_limits(configuration.project_limits)?;
-    check_file_platform(path, configuration)
+    key: &str,
+) -> Result<crate::Plan, ProjectOperationError> {
+    #[cfg(target_os = "linux")]
+    {
+        let locked = open_locked_project_with(path, configuration)?;
+        let mut evaluation = locked.evaluation()?;
+        if evaluation.select_package(key)? {
+            evaluation.into_selected_plan()
+        } else {
+            evaluation.evaluate_all()?;
+            evaluation.into_plan()
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, configuration, key);
+        Err(CheckFailure::UnsupportedPlatform.into())
+    }
 }
 
 fn validate_project_limits(limits: ProjectLimits) -> Result<(), CheckFailure> {
@@ -699,14 +710,6 @@ fn validate_project_platform(
     _configuration: &CheckConfiguration,
 ) -> Result<ValidatedProject, CheckFailure> {
     Err(CheckFailure::UnsupportedPlatform)
-}
-
-#[cfg(target_os = "linux")]
-fn check_file_platform(
-    path: &Path,
-    configuration: &CheckConfiguration,
-) -> Result<CheckReport, CheckFailure> {
-    loader::check_file_linux(path, configuration)
 }
 
 #[cfg(target_os = "linux")]
@@ -916,8 +919,13 @@ fn plan_project_platform(
 ) -> Result<crate::Plan, ProjectOperationError> {
     let project = open_locked_project_with(path, configuration)?;
     let mut evaluation = project.evaluation()?;
-    evaluation.evaluate_all()?;
-    evaluation.into_plan()
+    if evaluation.select_all_packages()? {
+        evaluation.include_project_outputs()?;
+        evaluation.into_selected_plan()
+    } else {
+        evaluation.evaluate_all()?;
+        evaluation.into_plan()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -996,14 +1004,6 @@ fn plan_project_platform(
     _configuration: &CheckConfiguration,
 ) -> Result<crate::Plan, ProjectOperationError> {
     Err(CheckFailure::UnsupportedPlatform.into())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn check_file_platform(
-    _path: &Path,
-    _configuration: &CheckConfiguration,
-) -> Result<CheckReport, CheckFailure> {
-    Err(CheckFailure::UnsupportedPlatform)
 }
 
 #[cfg(all(test, target_os = "linux"))]

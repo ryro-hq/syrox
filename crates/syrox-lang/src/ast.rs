@@ -179,18 +179,6 @@ pub enum OutputKind {
         name: Ident,
         ty: Type,
     },
-    Function {
-        name: Ident,
-        signature: Signature,
-        function: Path,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Signature {
-    pub parameters: Vec<Type>,
-    pub result: Type,
-    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -289,6 +277,8 @@ pub struct Block {
     pub statements: Vec<Statement>,
     pub tail: Option<Box<Expression>>,
     pub span: Span,
+    /// Contains recovery nodes or a missing closing delimiter; never executable.
+    pub incomplete: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -299,8 +289,22 @@ pub struct Statement {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StatementKind {
-    Let { name: Ident, value: Expression },
+    /// An unknown statement fragment, retained only by recoverable analysis.
+    Recovery {
+        binding: Option<RecoveredBinding>,
+    },
+    Let {
+        name: Ident,
+        ty: Option<Type>,
+        value: Expression,
+    },
     Expression(Expression),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveredBinding {
+    pub name: Ident,
+    pub ty: Option<Type>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -331,6 +335,7 @@ pub struct Expression {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExpressionKind {
+    Memoize(Box<Expression>),
     ModuleExports {
         namespace: Path,
         export: Ident,
@@ -371,6 +376,8 @@ pub enum ExpressionKind {
         path: Path,
         type_arguments: Vec<Type>,
         fields: Vec<StructField>,
+        /// Query-only malformed field fragments; strict parsing rejects these.
+        recovery: Vec<Span>,
     },
     List(Vec<Expression>),
     Erase {
