@@ -1,10 +1,24 @@
 #[cfg(target_os = "linux")]
 mod analyze;
 #[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
+mod evaluation;
+#[cfg(target_os = "linux")]
+pub use evaluation::{LockedProject, ProjectEvaluation, open_locked_project_with};
+mod editor;
+#[cfg(target_os = "linux")]
 mod loader;
 #[cfg(target_os = "linux")]
 mod locator;
+mod standard_library;
+pub use editor::{
+    ProjectAnalysis, ProjectAnalysisError, ProjectAnalysisLockStatus, ProjectAnalysisSnapshot,
+};
+#[cfg(target_os = "linux")]
+pub use editor::{open_project_analysis_with, open_standard_library_analysis_with};
 
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::string::FromUtf8Error;
@@ -156,6 +170,25 @@ pub struct LoadedProjectSource {
     source_id: SourceId,
 }
 
+#[derive(Debug)]
+pub struct LoadedProjectAsset {
+    relative_path: PathBuf,
+    size: u64,
+    digest: [u8; 32],
+}
+
+impl LoadedProjectAsset {
+    pub fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+    pub const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
+
 impl LoadedProjectSource {
     pub fn relative_path(&self) -> &Path {
         &self.relative_path
@@ -200,6 +233,11 @@ pub struct LoadedProject {
     sources: SourceSet,
     main_source: SourceId,
     inputs: Vec<LoadedProjectInput>,
+    assets: Vec<LoadedProjectAsset>,
+    #[cfg(target_os = "linux")]
+    child_edges: Vec<crate::lock::graph::ProjectEdge>,
+    #[cfg(target_os = "linux")]
+    children: Vec<(String, std::sync::Arc<LoadedProject>)>,
 }
 
 impl LoadedProject {
@@ -211,10 +249,6 @@ impl LoadedProject {
         &self.sources
     }
 
-    pub const fn main_source_id(&self) -> SourceId {
-        self.main_source
-    }
-
     pub fn main_source(&self) -> &Source {
         self.sources
             .get(self.main_source)
@@ -223,6 +257,22 @@ impl LoadedProject {
 
     pub fn inputs(&self) -> impl ExactSizeIterator<Item = &LoadedProjectInput> {
         self.inputs.iter()
+    }
+
+    pub fn assets(&self) -> impl ExactSizeIterator<Item = &LoadedProjectAsset> {
+        self.assets.iter()
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_self))]
+    pub(crate) fn child_edges(&self) -> &[crate::lock::graph::ProjectEdge] {
+        #[cfg(target_os = "linux")]
+        {
+            &self.child_edges
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            &[]
+        }
     }
 }
 
@@ -321,6 +371,14 @@ pub enum LockCleanupError {
 #[derive(Debug, Error)]
 pub enum ProjectOperationError {
     #[error(transparent)]
+    Editor(#[from] ProjectAnalysisError),
+    #[error("project has no value output `{name}`")]
+    MissingOutput { name: String },
+    #[error("catalog package set is invalid: {reason}")]
+    InvalidPackageSet { reason: &'static str },
+    #[error("package set has no entry `{key}`")]
+    MissingPackageReference { key: String },
+    #[error(transparent)]
     Check(#[from] CheckFailure),
     #[error("project has no {name}")]
     MissingLock { name: &'static str },
@@ -331,6 +389,16 @@ pub enum ProjectOperationError {
     },
     #[error("project sources have drifted from the lock")]
     ProjectDrift,
+    #[error("project graph lock has drifted from its authenticated child snapshots")]
+    GraphDrift,
+    #[error(
+        "project asset `{path}` is not authenticated in the consuming project with the requested digest"
+    )]
+    UnpinnedProjectAsset { path: String },
+    #[error("project source `{path}` has no authenticated project origin")]
+    UnknownProjectSourceOrigin { path: String },
+    #[error("project graph lock is malformed or noncanonical: {source}")]
+    MalformedGraphLock { source: crate::LockFormatError },
     #[error("authenticated standard library has drifted from the lock")]
     StandardLibraryDrift,
     #[error("project lock is a symbolic link")]
@@ -344,6 +412,8 @@ pub enum ProjectOperationError {
         #[source]
         source: io::Error,
     },
+    #[error("cannot remove obsolete graph lock: {source}")]
+    GraphRemoval { source: io::Error },
     #[error(transparent)]
     LockPublication(#[from] LockPublicationError),
     #[error(
@@ -403,6 +473,8 @@ pub enum CheckFailure {
     MissingMain { path: PathBuf },
     #[error("expected a regular .srx source file: {path}")]
     InvalidSourceFile { path: PathBuf },
+    #[error("expected a regular asset file: {path}")]
+    InvalidAssetFile { path: PathBuf },
     #[error("expected an input directory: {path}")]
     InputNotDirectory { path: PathBuf },
     #[error("symbolic links are not allowed in project sources: {path}")]
@@ -413,6 +485,18 @@ pub enum CheckFailure {
     UnsafeInputPath { name: String, path: PathBuf },
     #[error("duplicate project input name `{name}`")]
     DuplicateInputName { name: String },
+    #[error("invalid modules input: {reason}")]
+    InvalidModuleInput { reason: String },
+    #[error("child project {path} has no {name}")]
+    MissingChildLock { path: PathBuf, name: &'static str },
+    #[error("child project {path} lock could not be verified: {reason}")]
+    InvalidChildLock { path: PathBuf, reason: String },
+    #[error("project snapshot contains a cycle or repeated directory: {path}")]
+    ChildProjectCycle { path: PathBuf },
+    #[error("project graph exceeds the configured input directory depth of {limit}")]
+    ProjectGraphDepth { limit: usize },
+    #[error("project has more than {limit} imported project edges")]
+    TooManyProjectEdges { limit: usize },
     #[error("input paths overlap and would alias source authority: {first} and {second}")]
     AliasedInputPaths { first: PathBuf, second: PathBuf },
     #[error("source files are aliases of the same filesystem object: {first} and {second}")]
@@ -437,10 +521,6 @@ pub enum CheckFailure {
     },
 }
 
-pub fn check_path(path: &Path) -> Result<CheckReport, CheckFailure> {
-    check_path_with(path, &CheckConfiguration::default())
-}
-
 pub fn check_path_with(
     path: &Path,
     configuration: &CheckConfiguration,
@@ -459,10 +539,6 @@ pub fn check_project_with(
 ) -> Result<CheckReport, CheckFailure> {
     validate_project_limits(configuration.project_limits)?;
     check_project_platform(path, configuration)
-}
-
-pub fn validate_project(path: &Path) -> Result<ValidatedProject, CheckFailure> {
-    validate_project_with(path, &CheckConfiguration::default())
 }
 
 pub fn validate_project_with(
@@ -512,17 +588,53 @@ pub fn plan_project_with(
     plan_project_platform(path, configuration)
 }
 
-/// Compatibility entrypoint for callers that check one source file.
-pub fn check_file(path: &Path) -> Result<CheckReport, CheckFailure> {
-    check_file_with(path, &CheckConfiguration::default())
-}
-
-fn check_file_with(
+/// Project only the requested top-level value outputs from one verified
+/// snapshot. Repeated names select the same root; dependencies expressed as
+/// value references remain lazy. Package-name dependency expansion is separate.
+pub fn plan_project_outputs_with(
     path: &Path,
     configuration: &CheckConfiguration,
-) -> Result<CheckReport, CheckFailure> {
-    validate_project_limits(configuration.project_limits)?;
-    check_file_platform(path, configuration)
+    outputs: &[&str],
+) -> Result<crate::Plan, ProjectOperationError> {
+    #[cfg(target_os = "linux")]
+    {
+        let project = open_locked_project_with(path, configuration)?;
+        let mut evaluation = project.evaluation()?;
+        for output in outputs {
+            evaluation.evaluate_root(output)?;
+        }
+        evaluation.into_plan()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, configuration, outputs);
+        Err(CheckFailure::UnsupportedPlatform.into())
+    }
+}
+
+/// Plan one catalog key and its providers from a verified snapshot. Projects
+/// without a typed set retain their ordinary complete-Plan lookup behavior.
+pub fn plan_project_package_with(
+    path: &Path,
+    configuration: &CheckConfiguration,
+    key: &str,
+) -> Result<crate::Plan, ProjectOperationError> {
+    #[cfg(target_os = "linux")]
+    {
+        let locked = open_locked_project_with(path, configuration)?;
+        let mut evaluation = locked.evaluation()?;
+        if evaluation.select_package(key)? {
+            evaluation.into_selected_plan()
+        } else {
+            evaluation.evaluate_all()?;
+            evaluation.into_plan()
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, configuration, key);
+        Err(CheckFailure::UnsupportedPlatform.into())
+    }
 }
 
 fn validate_project_limits(limits: ProjectLimits) -> Result<(), CheckFailure> {
@@ -609,19 +721,11 @@ fn validate_project_platform(
 }
 
 #[cfg(target_os = "linux")]
-fn check_file_platform(
-    path: &Path,
-    configuration: &CheckConfiguration,
-) -> Result<CheckReport, CheckFailure> {
-    loader::check_file_linux(path, configuration)
-}
-
-#[cfg(target_os = "linux")]
 fn expected_lock(
-    validated: &ValidatedProject,
+    loaded: &LoadedProject,
     configuration: &CheckConfiguration,
 ) -> Result<crate::lock::LockManifest, ProjectOperationError> {
-    crate::lock::LockManifest::generate(validated.loaded(), configuration.standard_library.as_ref())
+    crate::lock::LockManifest::generate(loaded, configuration.standard_library.as_ref())
         .map_err(map_generated_lock_error)
 }
 
@@ -713,7 +817,29 @@ fn compare_lock(
         Some(crate::lock::LockDrift::StandardLibrary) => {
             Err(ProjectOperationError::StandardLibraryDrift)
         }
+        Some(crate::lock::LockDrift::Graph) => Err(ProjectOperationError::GraphDrift),
     }
+}
+
+#[cfg(target_os = "linux")]
+const GRAPH_LOCK_FILE: &str = "Syrox.graph.lock";
+
+#[cfg(target_os = "linux")]
+fn read_graph_lock(
+    project: &LoadedProject,
+) -> Result<Option<crate::lock::graph::GraphLock>, ProjectOperationError> {
+    let bytes = crate::linux_fd::read_bounded_beneath(
+        project.root.fd(),
+        Path::new(GRAPH_LOCK_FILE),
+        MAX_LOCK_BYTES,
+    )
+    .map_err(map_lock_io)?;
+    bytes
+        .map(|bytes| {
+            crate::lock::graph::GraphLock::parse(&bytes)
+                .map_err(|source| ProjectOperationError::MalformedGraphLock { source })
+        })
+        .transpose()
 }
 
 #[cfg(target_os = "linux")]
@@ -721,25 +847,46 @@ fn lock_project_platform(
     path: &Path,
     configuration: &CheckConfiguration,
 ) -> Result<LockReport, ProjectOperationError> {
-    let validated = loader::validate_project_linux(path, configuration)?;
-    let expected = expected_lock(&validated, configuration)?;
-    let existing = read_lock(validated.loaded())?;
-    let status = match existing {
-        None => crate::LockStatus::Created,
-        Some(ref existing) if existing.data() == expected.data() => crate::LockStatus::Unchanged,
-        Some(_) => crate::LockStatus::Updated,
+    let loaded = loader::load_project_linux(path, configuration)?;
+    let checked = analyze::check_loaded(&loaded, configuration)?;
+    let expected = expected_lock(&loaded, configuration)?;
+    let existing = read_lock(&loaded)?;
+    let old_graph = read_graph_lock(&loaded)?;
+    let status = match (&existing, &old_graph) {
+        (None, _) => crate::LockStatus::Created,
+        (Some(existing), None) if existing.data() == expected.data() => {
+            crate::LockStatus::Unchanged
+        }
+        _ => crate::LockStatus::Updated,
     };
     if status != crate::LockStatus::Unchanged {
         crate::linux_fd::write_atomic_beneath(
-            validated.loaded.root.fd(),
+            loaded.root.fd(),
             Path::new(crate::LOCK_FILE_NAME),
             expected.data(),
         )
         .map_err(map_lock_publication)?;
     }
+    if old_graph.is_some() {
+        let opened =
+            crate::linux_fd::open_existing_regular(loaded.root.fd(), Path::new(GRAPH_LOCK_FILE))
+                .map_err(|source| ProjectOperationError::GraphRemoval { source })?;
+        crate::linux_fd::unlink_opened(
+            loaded.root.fd(),
+            Path::new(GRAPH_LOCK_FILE),
+            opened.metadata().identity(),
+        )
+        .map_err(|source| ProjectOperationError::GraphRemoval { source })?;
+        crate::linux_fd::sync_directory(loaded.root.fd())
+            .map_err(|source| ProjectOperationError::GraphRemoval { source })?;
+    }
     Ok(LockReport {
         status,
-        check: validated.report(),
+        check: CheckReport {
+            path: loaded.path.clone(),
+            declarations: checked.resolved().parsed().declaration_count(),
+            realized_roots: 0,
+        },
         digest: *expected.digest(),
     })
 }
@@ -757,16 +904,11 @@ fn check_project_lock_platform(
     path: &Path,
     configuration: &CheckConfiguration,
 ) -> Result<LockReport, ProjectOperationError> {
-    let validated = loader::validate_project_linux(path, configuration)?;
-    let expected = expected_lock(&validated, configuration)?;
-    let actual = read_lock(validated.loaded())?.ok_or(ProjectOperationError::MissingLock {
-        name: crate::LOCK_FILE_NAME,
-    })?;
-    compare_lock(&actual, &expected)?;
+    let project = open_locked_project_with(path, configuration)?;
     Ok(LockReport {
         status: crate::LockStatus::Unchanged,
-        check: validated.report(),
-        digest: *actual.digest(),
+        check: project.check_report(),
+        digest: *project.lock_digest(),
     })
 }
 
@@ -783,19 +925,85 @@ fn plan_project_platform(
     path: &Path,
     configuration: &CheckConfiguration,
 ) -> Result<crate::Plan, ProjectOperationError> {
-    let validated = loader::validate_project_linux(path, configuration)?;
-    let expected = expected_lock(&validated, configuration)?;
-    let actual = read_lock(validated.loaded())?.ok_or(ProjectOperationError::MissingLock {
-        name: crate::LOCK_FILE_NAME,
-    })?;
-    compare_lock(&actual, &expected)?;
-    crate::Plan::from_realized(
-        validated.realized(),
-        *actual.digest(),
+    let project = open_locked_project_with(path, configuration)?;
+    let mut evaluation = project.evaluation()?;
+    if evaluation.select_all_packages()? {
+        evaluation.include_project_outputs()?;
+        evaluation.into_selected_plan()
+    } else {
+        evaluation.evaluate_all()?;
+        evaluation.into_plan()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn project_plan(
+    loaded: &LoadedProject,
+    realized: &RealizedProgram,
+    digest: [u8; 32],
+    configuration: &CheckConfiguration,
+) -> Result<crate::Plan, ProjectOperationError> {
+    analyze::require_success(loaded, realized)?;
+    let mut plan = crate::Plan::from_realized(
+        realized,
+        digest,
         configuration.policy.identity(),
         configuration.standard_library.as_ref(),
     )
-    .map_err(ProjectOperationError::from)
+    .map_err(ProjectOperationError::from)?;
+    let mut roots = BTreeMap::new();
+    collect_project_roots(loaded, loaded, SourceDomainId::project(), &mut roots);
+    for source in plan
+        .acquisitions()
+        .flat_map(crate::PlanAcquisition::sources)
+    {
+        if let Some(path) = source.url().strip_prefix("project:") {
+            let Some(owner) = source.owner().and_then(|domain| roots.get(&domain)) else {
+                return Err(ProjectOperationError::UnknownProjectSourceOrigin {
+                    path: path.to_owned(),
+                });
+            };
+            let Some(asset_path) = path.strip_prefix("assets/") else {
+                continue;
+            };
+            let relative = Path::new("assets").join(asset_path);
+            if !owner.assets().any(|asset| {
+                asset.relative_path() == relative
+                    && asset.digest() == source.digest().as_bytes()
+                    && asset.size() <= source.maximum_bytes()
+            }) {
+                return Err(ProjectOperationError::UnpinnedProjectAsset {
+                    path: relative.display().to_string(),
+                });
+            }
+        }
+    }
+    plan.bind_project_roots(
+        roots
+            .into_iter()
+            .map(|(domain, project)| (domain, project.path().to_path_buf()))
+            .collect(),
+    );
+    Ok(plan)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_project_roots<'a>(
+    root: &LoadedProject,
+    project: &'a LoadedProject,
+    domain: SourceDomainId,
+    roots: &mut BTreeMap<SourceDomainId, &'a LoadedProject>,
+) {
+    if roots.insert(domain, project).is_some() {
+        return;
+    }
+    for (alias, child) in &project.children {
+        let child_domain = root
+            .sources()
+            .child_project_domain(domain, alias)
+            .expect("validated child has a source domain");
+        collect_project_roots(root, child, child_domain, roots);
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -804,14 +1012,6 @@ fn plan_project_platform(
     _configuration: &CheckConfiguration,
 ) -> Result<crate::Plan, ProjectOperationError> {
     Err(CheckFailure::UnsupportedPlatform.into())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn check_file_platform(
-    _path: &Path,
-    _configuration: &CheckConfiguration,
-) -> Result<CheckReport, CheckFailure> {
-    Err(CheckFailure::UnsupportedPlatform)
 }
 
 #[cfg(all(test, target_os = "linux"))]

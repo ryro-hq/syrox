@@ -35,13 +35,6 @@ pub enum HostInspectError {
     InvalidCgroupParent,
 }
 
-/// Observe this process's current cgroup or an explicitly selected candidate
-/// parent. No process is migrated, cgroup created, namespace entered or policy
-/// installed by this diagnostic.
-pub fn inspect_host(parent: Option<&Path>) -> Result<HostInspection, HostInspectError> {
-    inspect_host_with_probe(parent, false)
-}
-
 /// With `probe_cgroup`, briefly create a child, verify its cpu/memory/pids
 /// controls and attempt migration of a gated copy of the running `srx` into
 /// that child. This tests this caller's source cgroup only; future callers

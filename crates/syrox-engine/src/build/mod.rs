@@ -351,7 +351,6 @@ pub fn check_build_host(toolchain: &Path) -> Result<(), BuildError> {
     preflight(toolchain)
 }
 
-#[cfg_attr(all(target_os = "linux", target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn build_managed(
     plan: &Plan,
     request: &BuildSpecification,

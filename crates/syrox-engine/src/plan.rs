@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::mem::size_of;
+use std::path::{Path, PathBuf};
 
 use syrox_lang::{
     CanonicalItemIdentity, CanonicalType, PrimitiveValue, RealizedProgram, RealizedRootOutcome,
@@ -11,6 +12,7 @@ use crate::AuthenticatedStandardLibrary;
 use crate::store::{ContentDigest, MAX_STORE_BLOB_BYTES};
 
 mod builds;
+mod recipes;
 pub use builds::PlanBuild;
 mod apps;
 pub use apps::PlanApplication;
@@ -81,6 +83,7 @@ pub struct PlanSourceRequest {
     url: String,
     digest: ContentDigest,
     maximum_bytes: u64,
+    owner: Option<syrox_lang::SourceDomainId>,
 }
 
 impl PlanSourceRequest {
@@ -92,6 +95,9 @@ impl PlanSourceRequest {
     }
     pub const fn maximum_bytes(&self) -> u64 {
         self.maximum_bytes
+    }
+    pub const fn owner(&self) -> Option<syrox_lang::SourceDomainId> {
+        self.owner
     }
 }
 
@@ -112,6 +118,10 @@ impl PlanAcquisition {
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PlanError {
+    #[error("invalid recipe root `{root}`: {reason}")]
+    InvalidRecipe { root: String, reason: &'static str },
+    #[error("function values cannot be serialized into a plan")]
+    FunctionValue,
     #[error("build root `{root}` is invalid: {reason}")]
     InvalidBuild { root: String, reason: &'static str },
     #[error("duplicate build for package `{package}`")]
@@ -222,6 +232,7 @@ pub enum PlanValue {
     Variant {
         ty: PlanType,
         index: u32,
+        payload: Vec<PlanValue>,
     },
 }
 
@@ -311,9 +322,20 @@ pub struct Plan {
     package_edges: usize,
     roots: Vec<PlanRoot>,
     canonical_display_bytes: usize,
+    project_roots: BTreeMap<syrox_lang::SourceDomainId, PathBuf>,
 }
 
 impl Plan {
+    pub(crate) fn bind_project_roots(
+        &mut self,
+        roots: BTreeMap<syrox_lang::SourceDomainId, PathBuf>,
+    ) {
+        self.project_roots = roots;
+    }
+
+    pub(crate) fn project_root(&self, owner: syrox_lang::SourceDomainId) -> Option<&Path> {
+        self.project_roots.get(&owner).map(PathBuf::as_path)
+    }
     pub const fn lock_digest(&self) -> &[u8; 32] {
         &self.lock_digest
     }
@@ -375,6 +397,17 @@ impl Plan {
         let root_count = realized.roots().len();
         let mut roots = budget.collection::<PlanRoot>(root_count)?;
         for root in realized.roots() {
+            // A lazy catalog contains memoized factories, not serializable
+            // build outputs. Its selected recipes enter the Plan separately.
+            if root.ty().is_some_and(is_lazy_package_set) {
+                if let Some(Value::Variant { index: 1, .. }) = root.value() {
+                    return Err(PlanError::InvalidRecipe {
+                        root: budget.string(root.name())?,
+                        reason: "duplicate catalog key",
+                    });
+                }
+                continue;
+            }
             budget.node::<PlanRoot>()?;
             let RealizedRootOutcome::Value(value) = root.outcome() else {
                 return Err(PlanError::UnrealizedRoot {
@@ -402,18 +435,25 @@ impl Plan {
             });
         }
         roots.sort_by(|left, right| (&left.domain, &left.path).cmp(&(&right.domain, &right.path)));
-        let (packages, package_edges) = extract_packages(realized, standard_library, &mut budget)?;
+        let components = recipes::components(realized, standard_library, &mut budget)?;
+        let (packages, package_edges) =
+            extract_packages(&components, standard_library, &mut budget)?;
         let acquisitions =
-            extract_acquisitions(realized, &packages, standard_library, &mut budget)?;
+            extract_acquisitions(&components, &packages, standard_library, &mut budget)?;
         let (builds, default_build) = builds::extract(
-            realized,
+            &components,
             &packages,
             &acquisitions,
             standard_library,
             &mut budget,
         )?;
-        let (applications, default_application) =
-            apps::extract(realized, &packages, &builds, standard_library, &mut budget)?;
+        let (applications, default_application) = apps::extract(
+            &components,
+            &packages,
+            &builds,
+            standard_library,
+            &mut budget,
+        )?;
         for build in &builds {
             if let Some(development) = build.development()
                 && !applications.iter().any(|app| {
@@ -441,10 +481,26 @@ impl Plan {
             package_edges,
             roots,
             canonical_display_bytes: 0,
+            project_roots: BTreeMap::new(),
         };
         plan.canonical_display_bytes = canonical_display_bytes(&plan, MAX_PLAN_DISPLAY_BYTES)?;
         Ok(plan)
     }
+}
+
+fn is_lazy_package_set(ty: &CanonicalType) -> bool {
+    let specialization = |ty: &CanonicalType, path: &[&str], arity| {
+        matches!(ty, CanonicalType::Specialization { template, arguments }
+            if template.domain() == syrox_lang::SourceDomainId::standard_library()
+                && template.path().iter().map(String::as_str).eq(path.iter().copied())
+                && arguments.len() == arity)
+    };
+    specialization(ty, &["std", "catalog", "PackageSet"], 1)
+        || matches!(ty, CanonicalType::Specialization { template, arguments }
+            if template.domain() == syrox_lang::SourceDomainId::standard_library()
+                && template.path() == ["std", "result", "Result"]
+                && arguments.len() == 2
+                && specialization(&arguments[0], &["std", "catalog", "PackageSet"], 1))
 }
 
 #[derive(Debug)]
@@ -539,7 +595,7 @@ impl ProjectionBudget {
 
 #[allow(clippy::too_many_lines)]
 fn extract_packages(
-    realized: &RealizedProgram,
+    components: &[recipes::Component<'_>],
     standard_library: Option<&AuthenticatedStandardLibrary>,
     budget: &mut ProjectionBudget,
 ) -> Result<(Vec<PlanPackage>, usize), PlanError> {
@@ -547,11 +603,11 @@ fn extract_packages(
         return Ok((Vec::new(), 0));
     }
 
-    let mut exact_roots: Vec<_> = realized
-        .roots()
+    let mut exact_roots: Vec<_> = components
+        .iter()
         .filter(|root| {
             root.identity().domain() == syrox_lang::SourceDomainId::project()
-                && root.ty().is_some_and(|ty| exact_nominal(ty, PACKAGE_PATH))
+                && exact_nominal(root.ty(), PACKAGE_PATH)
         })
         .collect();
     exact_roots.sort_by(|left, right| {
@@ -566,13 +622,9 @@ fn extract_packages(
     let mut candidates = Vec::with_capacity(exact_roots.len());
     for root in exact_roots {
         work.charge()?;
-        let Some(value) = root.value() else {
-            return Err(PlanError::UnrealizedRoot {
-                root: budget.string(root.name())?,
-            });
-        };
+        let value = root.value();
         let mut candidate = decode_package(root.name(), value, &mut edge_count, &mut work, budget)?;
-        if root.identity().path().len() == 1 {
+        if root.identity().path().len() == 1 || root.is_selected() {
             candidate.export = Some(root.name());
         }
         candidates.push(candidate);
@@ -715,7 +767,7 @@ fn extract_packages(
 
 #[allow(clippy::too_many_lines)]
 fn extract_acquisitions(
-    realized: &RealizedProgram,
+    components: &[recipes::Component<'_>],
     packages: &[PlanPackage],
     standard_library: Option<&AuthenticatedStandardLibrary>,
     budget: &mut ProjectionBudget,
@@ -723,13 +775,11 @@ fn extract_acquisitions(
     if standard_library.is_none() {
         return Ok(Vec::new());
     }
-    let mut roots: Vec<_> = realized
-        .roots()
+    let mut roots: Vec<_> = components
+        .iter()
         .filter(|root| {
             root.identity().domain() == syrox_lang::SourceDomainId::project()
-                && root
-                    .ty()
-                    .is_some_and(|ty| exact_nominal(ty, ACQUISITION_PATH))
+                && exact_nominal(root.ty(), ACQUISITION_PATH)
         })
         .collect();
     roots.sort_by(|left, right| {
@@ -752,7 +802,7 @@ fn extract_acquisitions(
             root: root_name.clone(),
             reason,
         };
-        let Some(Value::Struct { ty, fields }) = root.value() else {
+        let Value::Struct { ty, fields, .. } = root.value() else {
             return Err(malformed("value is not a struct"));
         };
         if !exact_nominal(ty, ACQUISITION_PATH)
@@ -795,7 +845,7 @@ fn extract_acquisitions(
                 package: package_id.clone(),
                 reason,
             };
-            let Value::Struct { ty, fields } = item else {
+            let Value::Struct { ty, fields, owner } = item else {
                 return Err(invalid("value is not a SourceRequest struct"));
             };
             if !exact_nominal(ty, SOURCE_REQUEST_PATH)
@@ -835,6 +885,7 @@ fn extract_acquisitions(
                 url: budget.string(url)?,
                 digest,
                 maximum_bytes: limit,
+                owner: *owner,
             });
         }
         acquisitions.push(PlanAcquisition {
@@ -881,7 +932,7 @@ fn decode_package<'a>(
     work: &mut Work,
     budget: &mut ProjectionBudget,
 ) -> Result<PackageCandidate<'a>, PlanError> {
-    let Value::Struct { ty, fields } = value else {
+    let Value::Struct { ty, fields, .. } = value else {
         return Err(malformed_package(root, "value is not a struct", budget)?);
     };
     if !exact_nominal(ty, PACKAGE_PATH) {
@@ -929,7 +980,7 @@ fn decode_package<'a>(
     let mut dependencies = Vec::with_capacity(items.len());
     for dependency in items {
         work.charge()?;
-        let Value::Struct { ty, fields } = dependency else {
+        let Value::Struct { ty, fields, .. } = dependency else {
             return Err(malformed_package(
                 root,
                 "dependency is not a Dependency struct",
@@ -1114,6 +1165,7 @@ fn plan_type(ty: &CanonicalType, budget: &mut ProjectionBudget) -> Result<PlanTy
             }
         }
         CanonicalType::List(item) => PlanType::List(Box::new(plan_type(item, budget)?)),
+        CanonicalType::Function { .. } => return Err(PlanError::FunctionValue),
     })
 }
 
@@ -1131,6 +1183,12 @@ fn primitive(
 fn plan_value(value: &Value, budget: &mut ProjectionBudget) -> Result<PlanValue, PlanError> {
     budget.node::<PlanValue>()?;
     Ok(match value {
+        Value::Function { .. }
+        | Value::Closure { .. }
+        | Value::VariantConstructor { .. }
+        | Value::MemoizedFunction { .. } => {
+            return Err(PlanError::FunctionValue);
+        }
         Value::Unit => PlanValue::Unit,
         Value::Int(value) => PlanValue::Int(*value),
         Value::Str(value) => PlanValue::Str(budget.string(value)?),
@@ -1153,7 +1211,7 @@ fn plan_value(value: &Value, budget: &mut ProjectionBudget) -> Result<PlanValue,
                 items: plan_items,
             }
         }
-        Value::Struct { ty, fields } => {
+        Value::Struct { ty, fields, .. } => {
             let mut plan_fields = budget.collection::<(String, PlanValue)>(fields.len())?;
             for (name, value) in fields {
                 plan_fields.push((budget.string(name)?, plan_value(value, budget)?));
@@ -1163,10 +1221,17 @@ fn plan_value(value: &Value, budget: &mut ProjectionBudget) -> Result<PlanValue,
                 fields: plan_fields,
             }
         }
-        Value::Variant { ty, index } => PlanValue::Variant {
-            ty: plan_type(ty, budget)?,
-            index: *index,
-        },
+        Value::Variant { ty, index, payload } => {
+            let mut fields = budget.collection::<PlanValue>(payload.len())?;
+            for field in payload {
+                fields.push(plan_value(field, budget)?);
+            }
+            PlanValue::Variant {
+                ty: plan_type(ty, budget)?,
+                index: *index,
+                payload: fields,
+            }
+        }
     })
 }
 
@@ -1211,6 +1276,7 @@ mod tests {
     #[test]
     fn malformed_exact_package_value_is_not_ignored() {
         let value = Value::Struct {
+            owner: None,
             ty: nominal(PACKAGE_PATH),
             fields: vec![("id".to_owned(), Value::Str("not nominal".to_owned()))],
         };
@@ -1307,6 +1373,7 @@ mod tests {
             package_edges: 0,
             roots: Vec::new(),
             canonical_display_bytes: 0,
+            project_roots: BTreeMap::new(),
         };
         let bytes = canonical_display_bytes(&plan, usize::MAX).unwrap();
         assert_eq!(canonical_display_bytes(&plan, bytes), Ok(bytes));

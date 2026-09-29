@@ -5,11 +5,19 @@
 //! namespace before looking up references, so declaration order is irrelevant.
 
 mod body;
+mod collections;
+mod editor;
 mod lookup;
 mod model;
 mod namespace;
+mod owners;
 
 pub use model::*;
+pub use owners::{
+    NamespaceDependency, NamespaceExport, NamespaceOutcome, NamespaceQuery, NamespaceTarget,
+    OwnerDiagnostic, OwnerLocal, OwnerReference, OwnerReferenceTarget, OwnerRelativeSpan,
+    OwnerResolution, OwnerSourceMap, ResolutionOwnerKey, ResolutionOwnerPart,
+};
 
 #[cfg(test)]
 mod tests;
@@ -33,15 +41,17 @@ pub(super) struct PendingItem {
     pub(super) kind: ResolvedItemKind,
     pub(super) span: Span,
     pub(super) variants: Vec<(String, Span)>,
+    pub(super) public: bool,
 }
 
 pub(super) type DomainPath = (SourceDomainId, Vec<String>);
 pub(super) type BoundarySpans = (Option<Span>, Option<Span>);
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct ModuleInfo {
     pub(super) declarations: BTreeMap<String, ItemId>,
     pub(super) children: BTreeMap<String, ModuleId>,
+    pub(super) public_children: BTreeSet<String>,
     pub(super) imports: BTreeMap<String, ItemId>,
     pub(super) exports: BTreeMap<String, ItemId>,
     pub(super) closed: bool,
@@ -63,19 +73,37 @@ pub(super) struct Resolver<'a> {
     pub(super) module_info: Vec<ModuleInfo>,
     pub(super) items: Vec<ResolvedItem>,
     pub(super) item_ids: BTreeMap<DomainPath, ItemId>,
-    pub(super) input_domains: BTreeMap<String, SourceDomainId>,
+    pub(super) input_domains: BTreeMap<SourceDomainId, BTreeMap<String, SourceDomainId>>,
+    pub(super) public_imports: BTreeSet<(ModuleId, String)>,
     pub(super) enum_variants: BTreeMap<ItemId, BTreeMap<String, u32>>,
     pub(super) references: Vec<ResolvedReference>,
+    pub(super) module_exports: BTreeMap<(usize, u32, u32), Vec<ResolvedModuleExport>>,
     pub(super) locals: Vec<ResolvedLocal>,
     pub(super) diagnostics: Vec<Diagnostic>,
     pub(super) work: usize,
     pub(super) exhausted: bool,
     pub(super) next_local: u32,
+    cancellation: Option<&'a crate::AnalysisCancellation>,
+    editor_locals: Vec<(String, LocalId, Span)>,
+    owners: owners::OwnerTable,
 }
 
 /// Resolve all names without changing the parsed syntax tree.
 pub fn resolve(parsed: ParsedSources) -> Result<ResolvedProgram, Vec<Diagnostic>> {
+    let (resolved, diagnostics, _) = resolve_partial(parsed, None);
+    if diagnostics.is_empty() {
+        Ok(resolved)
+    } else {
+        Err(diagnostics)
+    }
+}
+
+pub(crate) fn resolve_partial(
+    parsed: ParsedSources,
+    cancellation: Option<&crate::AnalysisCancellation>,
+) -> (ResolvedProgram, Vec<Diagnostic>, bool) {
     let mut resolver = Resolver::new(&parsed);
+    resolver.cancellation = cancellation;
     resolver.collect();
     if !resolver.exhausted {
         resolver.bind_interfaces_and_imports();
@@ -88,21 +116,34 @@ pub fn resolve(parsed: ParsedSources) -> Result<ResolvedProgram, Vec<Diagnostic>
             diagnostic.message.clone(),
         )
     });
-    if resolver.diagnostics.is_empty() {
+    {
         let modules = std::mem::take(&mut resolver.modules);
         let items = std::mem::take(&mut resolver.items);
         let references = std::mem::take(&mut resolver.references);
         let locals = std::mem::take(&mut resolver.locals);
+        let module_exports = std::mem::take(&mut resolver.module_exports);
+        let diagnostics = std::mem::take(&mut resolver.diagnostics);
+        let exhausted = resolver.exhausted;
+        let editor = if cancellation.is_some() && !exhausted {
+            Some(std::sync::Arc::new(editor::Namespace::take(&mut resolver)))
+        } else {
+            None
+        };
         drop(resolver);
-        Ok(ResolvedProgram {
-            parsed,
-            modules,
-            items,
-            references,
-            locals,
-        })
-    } else {
-        Err(std::mem::take(&mut resolver.diagnostics))
+        (
+            ResolvedProgram {
+                ambiguous_names: std::sync::OnceLock::new(),
+                parsed,
+                modules,
+                items,
+                references,
+                locals,
+                module_exports,
+                editor,
+            },
+            diagnostics,
+            exhausted,
+        )
     }
 }
 
@@ -116,17 +157,29 @@ impl<'a> Resolver<'a> {
             items: Vec::new(),
             item_ids: BTreeMap::new(),
             input_domains: BTreeMap::new(),
+            public_imports: BTreeSet::new(),
             enum_variants: BTreeMap::new(),
             references: Vec::new(),
+            module_exports: BTreeMap::new(),
             locals: Vec::new(),
             diagnostics: Vec::new(),
             work: 0,
             exhausted: false,
             next_local: 0,
+            cancellation: None,
+            editor_locals: Vec::new(),
+            owners: owners::OwnerTable::default(),
         }
     }
 
     pub(super) fn charge(&mut self, span: Span) -> bool {
+        if self
+            .cancellation
+            .is_some_and(|cancellation| cancellation.check().is_err())
+        {
+            self.exhausted = true;
+            return false;
+        }
         self.work = self.work.saturating_add(1);
         if self.work <= MAX_RESOLUTION_WORK {
             return true;
@@ -140,11 +193,14 @@ impl<'a> Resolver<'a> {
 
     pub(super) fn error(&mut self, message: impl Into<String>, span: Span) {
         if self.diagnostics.len() < MAX_DIAGNOSTICS {
-            self.diagnostics.push(Diagnostic::error(message, span));
+            self.diagnostics.push(
+                Diagnostic::error(message, span).with_code(crate::DiagnosticCode::Resolution),
+            );
         }
     }
 
-    pub(super) fn local(&mut self, span: Span) -> Option<LocalId> {
+    pub(super) fn local(&mut self, name: &crate::Ident, kind: LocalKind) -> Option<LocalId> {
+        let span = name.span;
         if !self.charge(span) {
             return None;
         }
@@ -154,7 +210,12 @@ impl<'a> Resolver<'a> {
             return None;
         };
         self.next_local = next;
-        self.locals.push(ResolvedLocal { id, span });
+        self.locals.push(ResolvedLocal {
+            id,
+            span,
+            name: name.text.clone(),
+            kind,
+        });
         Some(id)
     }
 
@@ -167,7 +228,7 @@ impl<'a> Resolver<'a> {
                 .items
                 .iter()
                 .rev()
-                .map(|item| (item, Vec::new()))
+                .map(|item| (item, source.module().to_vec()))
                 .collect();
             while let Some((item, module_path)) = stack.pop() {
                 if let ItemKind::Module(module) = &item.kind {

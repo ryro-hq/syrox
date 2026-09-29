@@ -1,0 +1,6 @@
+mod std::option {
+    enum Option<T> {
+        None,
+        Some(T),
+    }
+}

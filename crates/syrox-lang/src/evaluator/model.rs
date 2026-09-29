@@ -60,6 +60,11 @@ pub enum CanonicalType {
         arguments: Vec<Arc<CanonicalType>>,
     },
     List(Arc<CanonicalType>),
+    Function {
+        parameters: Vec<Arc<CanonicalType>>,
+        result: Arc<CanonicalType>,
+        once: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -72,6 +77,28 @@ pub enum PrimitiveValue {
 /// copies are explicit and reject resource-bearing values.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Value {
+    MemoizedFunction {
+        ty: Arc<CanonicalType>,
+        id: super::MemoId,
+    },
+    VariantConstructor {
+        ty: Arc<CanonicalType>,
+        index: u32,
+    },
+    Function {
+        item: crate::ItemId,
+        ty: Arc<CanonicalType>,
+        substitutions: std::collections::BTreeMap<crate::LocalId, crate::Ty>,
+    },
+    Closure {
+        ty: Arc<CanonicalType>,
+        once: bool,
+        owner: crate::SourceDomainId,
+        body: Arc<crate::Block>,
+        parameters: Vec<crate::LocalId>,
+        captures: Vec<(crate::LocalId, Value)>,
+        substitutions: std::collections::BTreeMap<crate::LocalId, crate::Ty>,
+    },
     Unit,
     Int(i64),
     Str(String),
@@ -87,10 +114,12 @@ pub enum Value {
     Struct {
         ty: Arc<CanonicalType>,
         fields: Vec<(String, Value)>,
+        owner: Option<crate::SourceDomainId>,
     },
     Variant {
         ty: Arc<CanonicalType>,
         index: u32,
+        payload: Vec<Value>,
     },
 }
 
@@ -100,10 +129,14 @@ impl Value {
             Self::Unit => Arc::new(CanonicalType::Unit),
             Self::Int(_) => Arc::new(CanonicalType::Int),
             Self::Str(_) => Arc::new(CanonicalType::Str),
-            Self::Nominal { ty, .. } | Self::Struct { ty, .. } | Self::Variant { ty, .. } => {
-                ty.clone()
-            }
-            Self::List { ty, .. } => ty.clone(),
+            Self::Nominal { ty, .. }
+            | Self::Struct { ty, .. }
+            | Self::Variant { ty, .. }
+            | Self::List { ty, .. }
+            | Self::Function { ty, .. }
+            | Self::MemoizedFunction { ty, .. }
+            | Self::VariantConstructor { ty, .. }
+            | Self::Closure { ty, .. } => ty.clone(),
         }
     }
 
@@ -112,7 +145,16 @@ impl Value {
             Self::Nominal { resource, .. } => *resource,
             Self::List { items, .. } => items.iter().any(Self::affine),
             Self::Struct { fields, .. } => fields.iter().any(|(_, value)| value.affine()),
-            Self::Unit | Self::Int(_) | Self::Str(_) | Self::Variant { .. } => false,
+            Self::Variant { payload, .. } => payload.iter().any(Self::affine),
+            Self::Closure { once, captures, .. } => {
+                *once || captures.iter().any(|(_, value)| value.affine())
+            }
+            Self::Unit
+            | Self::Int(_)
+            | Self::Str(_)
+            | Self::VariantConstructor { .. }
+            | Self::Function { .. }
+            | Self::MemoizedFunction { .. } => false,
         }
     }
 }
@@ -150,9 +192,13 @@ pub struct RealizedRoot {
     pub(super) ty: Option<Arc<CanonicalType>>,
     pub(super) outcome: RealizedRootOutcome,
     pub(super) claims: Vec<ResourceClaim>,
+    pub(super) selected: bool,
 }
 
 impl RealizedRoot {
+    pub fn is_selected(&self) -> bool {
+        self.selected
+    }
     pub fn name(&self) -> &str {
         &self.name
     }

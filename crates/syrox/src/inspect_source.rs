@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use syrox_engine::{
     ArchiveFormat, ArchiveLimits, CheckConfiguration, Store, inspect_archive,
-    inspect_source_archive, plan_project_with,
+    inspect_source_archive, plan_project_package_with,
 };
 
 pub(super) fn run(
@@ -32,7 +32,8 @@ fn inspect(
     store_path: &Path,
     configuration: &CheckConfiguration,
 ) -> Result<String, String> {
-    let plan = plan_project_with(project, configuration).map_err(|error| error.to_string())?;
+    let plan = plan_project_package_with(project, configuration, package)
+        .map_err(|error| error.to_string())?;
     let source = plan
         .acquisitions()
         .find(|acquisition| acquisition.package().as_str() == package)

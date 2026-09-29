@@ -4,14 +4,13 @@ mod environment;
 mod index;
 mod model;
 mod runtime;
+mod session;
 mod types;
 
 #[cfg(test)]
 mod tests;
 
-use std::{collections::BTreeMap, mem::size_of};
-
-use crate::{CheckPolicy, CheckedProgram, ItemKind, OutputKind, Span};
+use crate::{CheckPolicy, CheckedProgram, Span};
 
 pub use environment::{EnvironmentError, EvaluationEnvironment, EvaluationSetupError};
 pub use model::{
@@ -21,8 +20,8 @@ pub use model::{
     RealizedProgram, RealizedRoot, RealizedRootOutcome, ResourceClaim, ResourceClaimKey, Value,
 };
 
-use index::ProgramIndex;
-use runtime::Evaluator;
+pub use runtime::MemoId;
+pub use session::{EvaluationQueryError, EvaluationSession};
 
 pub fn evaluate(
     program: &CheckedProgram,
@@ -38,105 +37,9 @@ pub fn evaluate_with_limits(
     environment: &EvaluationEnvironment,
     limits: EvaluationLimits,
 ) -> Result<RealizedProgram, EvaluationSetupError> {
-    validate_limits(limits)?;
-    program
-        .require_policy(policy)
-        .map_err(|mismatch| EvaluationSetupError::PolicyMismatch {
-            checked: mismatch.checked,
-            supplied: mismatch.supplied,
-        })?;
-    if &environment.policy != policy {
-        return Err(EvaluationSetupError::EnvironmentPolicyMismatch);
-    }
-    if environment.predicates.len() != policy.predicates().len()
-        || policy
-            .predicates()
-            .any(|rule| !environment.predicates.contains_key(&rule.name))
-    {
-        return Err(EvaluationSetupError::MissingPredicateCallback);
-    }
-
-    let index = ProgramIndex::new(program, policy, limits)?;
-    let mut roots = Vec::new();
-    let mut diagnostics_used = 0_usize;
-    let mut total_steps = 0_usize;
-    let mut retained_expansion = 0_usize;
-    for source in program.resolved().parsed().iter() {
-        if source.domain() != crate::SourceDomainId::project() {
-            continue;
-        }
-        for item in &source.program().items {
-            let ItemKind::Outputs(outputs) = &item.kind else {
-                continue;
-            };
-            for output in &outputs.entries {
-                let OutputKind::Value { name, value, .. } = &output.kind else {
-                    continue;
-                };
-                retained_expansion = retained_expansion.saturating_add(size_of::<RealizedRoot>());
-                if retained_expansion > limits.max_retained_expansion_bytes {
-                    return Err(EvaluationSetupError::EvaluationRetainedExpansionLimit);
-                }
-                let root_limits = EvaluationLimits {
-                    max_total_steps: limits.max_total_steps.saturating_sub(total_steps),
-                    max_retained_expansion_bytes: limits
-                        .max_retained_expansion_bytes
-                        .saturating_sub(retained_expansion),
-                    max_diagnostics: limits.max_diagnostics.saturating_sub(diagnostics_used),
-                    ..limits
-                };
-                let root = index
-                    .identity_at(output.span)
-                    .ok_or(EvaluationSetupError::MissingRootIdentity)?;
-                let mut evaluator = Evaluator::new(
-                    program,
-                    policy,
-                    environment,
-                    &index,
-                    root_limits,
-                    value.span,
-                    root.clone(),
-                );
-                let ty = evaluator.canonical_expression_type(value);
-                if let Some(error) = evaluator.operation_error {
-                    return Err(error);
-                }
-                let evaluated = evaluator
-                    .expand(name.text.len(), name.span)
-                    .and_then(|()| evaluator.expression(value, &BTreeMap::new()));
-                if let Some(error) = evaluator.operation_error {
-                    return Err(error);
-                }
-                total_steps = total_steps.saturating_add(evaluator.steps);
-                retained_expansion = retained_expansion.saturating_add(evaluator.expansion);
-                if total_steps > limits.max_total_steps {
-                    return Err(EvaluationSetupError::EvaluationWorkLimit);
-                }
-                if retained_expansion > limits.max_retained_expansion_bytes {
-                    return Err(EvaluationSetupError::EvaluationRetainedExpansionLimit);
-                }
-                let claims = std::mem::take(&mut evaluator.claims)
-                    .into_iter()
-                    .map(|(key, span)| ResourceClaim { key, span })
-                    .collect();
-                diagnostics_used = diagnostics_used.saturating_add(evaluator.diagnostics.len());
-                let outcome = match evaluated {
-                    Ok(value) if evaluator.diagnostics.is_empty() => {
-                        RealizedRootOutcome::Value(value)
-                    }
-                    _ => RealizedRootOutcome::Failed(evaluator.diagnostics),
-                };
-                roots.push(RealizedRoot {
-                    name: name.text.clone(),
-                    identity: root.clone(),
-                    ty,
-                    outcome,
-                    claims,
-                });
-            }
-        }
-    }
-    Ok(RealizedProgram { roots })
+    let mut session = EvaluationSession::new(program, policy, environment, limits)?;
+    session.evaluate_all()?;
+    session.into_realized()
 }
 
 fn validate_limits(limits: EvaluationLimits) -> Result<(), EvaluationSetupError> {

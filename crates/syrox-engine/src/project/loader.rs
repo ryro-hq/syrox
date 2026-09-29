@@ -1,5 +1,7 @@
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
@@ -8,19 +10,25 @@ use std::ffi::OsStr;
 #[cfg(target_os = "linux")]
 use std::os::fd::BorrowedFd;
 
-use syrox_lang::{MAX_SOURCE_BYTES, MAX_SOURCES, SourceSet};
+use syrox_lang::{MAX_SOURCE_BYTES, MAX_SOURCES, SourceDomainId, SourceSet};
 
 #[cfg(target_os = "linux")]
 use crate::linux_fd::{self, FileIdentity, FileType, OpenError, OpenedPath};
 
 #[cfg(target_os = "linux")]
+use super::LoadedProjectAsset;
+#[cfg(target_os = "linux")]
 use super::analyze::{check_sources, validate_loaded};
 #[cfg(target_os = "linux")]
-use super::locator::root_input_locators;
+use super::locator::{InputLocator, root_input_locators};
 use super::{
     CheckConfiguration, CheckFailure, LoadedProject, LoadedProjectInput, LoadedProjectSource,
     ProjectLimits, ValidatedProject,
 };
+#[cfg(target_os = "linux")]
+use crate::lock::graph::ProjectEdge;
+#[cfg(target_os = "linux")]
+use sha2::{Digest, Sha256};
 
 fn add_standard_library(
     sources: &mut SourceSet,
@@ -46,9 +54,23 @@ pub(super) struct InputRoot {
 }
 
 #[cfg(target_os = "linux")]
+struct GraphLoad {
+    ancestry: Vec<FileIdentity>,
+    snapshots: HashMap<FileIdentity, LoadedSnapshot>,
+}
+
+#[cfg(target_os = "linux")]
+struct LoadedSnapshot {
+    project: Arc<LoadedProject>,
+    depth: usize,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
 struct LoadedInput {
     name: String,
     relative: PathBuf,
+    modules: bool,
     files: Vec<(PathBuf, String)>,
 }
 
@@ -113,16 +135,6 @@ pub(super) fn validate_project_linux(
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn check_file_linux(
-    path: &Path,
-    configuration: &CheckConfiguration,
-) -> Result<super::CheckReport, CheckFailure> {
-    let mut budget = LoadBudget::new(configuration.project_limits);
-    let opened = open_top(path, &mut budget)?;
-    check_open_file(path, opened, configuration, &mut budget)
-}
-
-#[cfg(target_os = "linux")]
 fn check_open_file(
     path: &Path,
     opened: OpenedPath,
@@ -144,6 +156,22 @@ fn load_open_project(
     project: OpenedPath,
     configuration: &CheckConfiguration,
     budget: &mut LoadBudget,
+) -> Result<LoadedProject, CheckFailure> {
+    let mut graph = GraphLoad {
+        ancestry: vec![identity(&project)],
+        snapshots: HashMap::new(),
+    };
+    load_open_project_graph(path, project, configuration, budget, &mut graph, true)
+}
+
+#[cfg(target_os = "linux")]
+fn load_open_project_graph(
+    path: &Path,
+    project: OpenedPath,
+    configuration: &CheckConfiguration,
+    budget: &mut LoadBudget,
+    graph: &mut GraphLoad,
+    include_standard_library: bool,
 ) -> Result<LoadedProject, CheckFailure> {
     let main_path = path.join("main.srx");
     let main = match open_beneath(
@@ -171,50 +199,225 @@ fn load_open_project(
             errors,
         })?;
     let locators = root_input_locators(&parsed_main)?;
-
     validate_input_paths(path, &locators, budget)?;
     let mut directory_identities = HashMap::new();
     directory_identities.insert(identity(&project), path.to_path_buf());
     let mut file_identities = HashMap::new();
     file_identities.insert(main_identity, main_path);
-    let mut loaded = Vec::with_capacity(locators.len());
-    for (name, relative) in &locators {
-        let root = open_input_root(
-            path,
-            project.fd(),
-            name,
-            relative,
-            &mut directory_identities,
-            budget,
-        )?;
-        let name = root.name.clone();
-        let root_relative = root.relative.clone();
-        let files = walk_input(
-            path,
-            root,
-            &mut directory_identities,
-            &mut file_identities,
-            budget,
-        )?;
-        loaded.push(LoadedInput {
-            name,
-            relative: root_relative,
-            files,
-        });
-    }
+    let loaded = load_local_inputs(
+        path,
+        &project,
+        &locators,
+        &mut directory_identities,
+        &mut file_identities,
+        budget,
+    )?;
+    let assets = load_assets(
+        path,
+        &project,
+        &mut directory_identities,
+        &mut file_identities,
+        budget,
+    )?;
 
     let mut sources = SourceSet::new();
     let main_source = sources.add(path.join("main.srx").display().to_string(), main_text)?;
+    let retained_inputs = load_input_sources(&mut sources, SourceDomainId::project(), loaded)?;
+    if include_standard_library {
+        add_standard_library(&mut sources, budget, configuration)?;
+    }
+    let children = load_child_edges(
+        &mut sources,
+        &locators,
+        path,
+        &project,
+        configuration,
+        budget,
+        graph,
+    )?;
+    Ok(LoadedProject {
+        path: path.to_path_buf(),
+        root: project,
+        sources,
+        main_source,
+        inputs: retained_inputs,
+        assets,
+        child_edges: children.edges,
+        children: children.projects,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn load_local_inputs(
+    path: &Path,
+    project: &OpenedPath,
+    locators: &[InputLocator],
+    directories: &mut HashMap<FileIdentity, PathBuf>,
+    files: &mut HashMap<FileIdentity, PathBuf>,
+    budget: &mut LoadBudget,
+) -> Result<Vec<LoadedInput>, CheckFailure> {
+    let mut loaded = Vec::with_capacity(locators.len());
+    for locator in locators.iter().filter(|locator| !locator.child) {
+        if locator.relative.starts_with("assets") {
+            return Err(CheckFailure::AliasedInputPaths {
+                first: path.join("assets"),
+                second: path.join(&locator.relative),
+            });
+        }
+        let root = open_input_root(
+            path,
+            project.fd(),
+            &locator.name,
+            &locator.relative,
+            directories,
+            budget,
+        )?;
+        let name = root.name.clone();
+        let relative = root.relative.clone();
+        let files = walk_input(path, root, directories, files, budget)?;
+        loaded.push(LoadedInput {
+            name,
+            relative,
+            modules: locator.modules,
+            files,
+        });
+    }
+    Ok(loaded)
+}
+
+#[cfg(target_os = "linux")]
+struct LoadedChildren {
+    edges: Vec<ProjectEdge>,
+    projects: Vec<(String, Arc<LoadedProject>)>,
+}
+
+#[cfg(target_os = "linux")]
+fn load_child_edges(
+    sources: &mut SourceSet,
+    locators: &[InputLocator],
+    path: &Path,
+    project: &OpenedPath,
+    configuration: &CheckConfiguration,
+    budget: &mut LoadBudget,
+    graph: &mut GraphLoad,
+) -> Result<LoadedChildren, CheckFailure> {
+    let mut child_edges = Vec::new();
+    let mut children = Vec::new();
+    let mut grafts = HashMap::new();
+    for locator in locators.iter().filter(|locator| locator.child) {
+        let child_path = path.join("..").join(&locator.relative);
+        budget.charge_work()?;
+        if child_edges.len() >= crate::lock::graph::MAX_PROJECT_EDGES {
+            return Err(CheckFailure::TooManyProjectEdges {
+                limit: crate::lock::graph::MAX_PROJECT_EDGES,
+            });
+        }
+        let child = open_child_root(project, path, &locator.relative, &child_path, budget)?;
+        let child_identity = identity(&child);
+        if graph.ancestry.contains(&child_identity) {
+            return Err(CheckFailure::ChildProjectCycle { path: child_path });
+        }
+        if graph.ancestry.len() >= configuration.project_limits.max_directory_depth {
+            return Err(CheckFailure::ProjectGraphDepth {
+                limit: configuration.project_limits.max_directory_depth,
+            });
+        }
+        let pinned = if let Some(snapshot) = graph.snapshots.get(&child_identity) {
+            if graph.ancestry.len().saturating_add(snapshot.depth)
+                > configuration.project_limits.max_directory_depth
+            {
+                return Err(CheckFailure::ProjectGraphDepth {
+                    limit: configuration.project_limits.max_directory_depth,
+                });
+            }
+            Arc::clone(&snapshot.project)
+        } else {
+            graph.ancestry.push(child_identity);
+            let result =
+                load_open_project_graph(&child_path, child, configuration, budget, graph, false);
+            graph.ancestry.pop();
+            Arc::new(result?)
+        };
+        let expected =
+            crate::lock::LockManifest::generate(&pinned, configuration.standard_library.as_ref())
+                .map_err(|error| CheckFailure::InvalidChildLock {
+                path: child_path.clone(),
+                reason: error.to_string(),
+            })?;
+        let actual = verify_child_lock(&pinned, &expected)?;
+        let mut depth = 1;
+        for (_, descendant) in &pinned.children {
+            budget.charge_work()?;
+            depth = depth.max(1 + graph.snapshots[&identity(&descendant.root)].depth);
+        }
+        graph
+            .snapshots
+            .entry(child_identity)
+            .or_insert_with(|| LoadedSnapshot {
+                project: Arc::clone(&pinned),
+                depth,
+            });
+        let origin = format!("path:../{}", locator.relative.display());
+        child_edges.push(
+            ProjectEdge::new(&locator.name, &origin, *actual.digest()).map_err(|error| {
+                CheckFailure::InvalidChildLock {
+                    path: child_path.clone(),
+                    reason: error.to_string(),
+                }
+            })?,
+        );
+        graft_child(
+            sources,
+            SourceDomainId::project(),
+            &locator.name,
+            &pinned,
+            budget,
+            &mut grafts,
+        )?;
+        children.push((locator.name.clone(), pinned));
+    }
+    Ok(LoadedChildren {
+        edges: child_edges,
+        projects: children,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn load_input_sources(
+    sources: &mut SourceSet,
+    parent: SourceDomainId,
+    loaded: Vec<LoadedInput>,
+) -> Result<Vec<LoadedProjectInput>, CheckFailure> {
     let mut retained_inputs = Vec::with_capacity(loaded.len());
     for input in loaded {
-        let domain = sources.create_input_domain(&input.name)?;
+        let domain = sources.create_child_input_domain(parent, &input.name)?;
         let mut retained_files = Vec::with_capacity(input.files.len());
+        let mut module_owners = std::collections::BTreeMap::new();
         for (relative, text) in input.files {
-            let source_id = sources.add_to_input_domain(
-                domain,
-                format!("{}/{}", input.name, relative.display()),
-                text,
-            )?;
+            let logical_name = format!("{}/{}", input.name, relative.display());
+            let source_id = if input.modules {
+                let mut module = relative
+                    .iter()
+                    .map(|part| part.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                let file = module.pop().expect("input source has a file name");
+                let stem = file.strip_suffix(".srx").expect("input source is .srx");
+                if stem != "package" || module.is_empty() {
+                    module.push(stem.to_owned());
+                }
+                if let Some(first) = module_owners.insert(module.clone(), relative.clone()) {
+                    return Err(CheckFailure::InvalidModuleInput {
+                        reason: format!(
+                            "files `{}` and `{}` share one recipe module",
+                            first.display(),
+                            relative.display()
+                        ),
+                    });
+                }
+                sources.add_to_input_module(domain, logical_name, text, module)?
+            } else {
+                sources.add_to_input_domain(domain, logical_name, text)?
+            };
             retained_files.push(LoadedProjectSource {
                 relative_path: relative,
                 source_id,
@@ -222,41 +425,291 @@ fn load_open_project(
         }
         retained_inputs.push(LoadedProjectInput {
             name: input.name,
-            locator: format!("path:{}", input.relative.display()),
+            locator: format!(
+                "{}:{}",
+                if input.modules { "modules" } else { "path" },
+                input.relative.display()
+            ),
             domain,
             files: retained_files,
         });
     }
-    add_standard_library(&mut sources, budget, configuration)?;
-    Ok(LoadedProject {
+    Ok(retained_inputs)
+}
+
+#[cfg(target_os = "linux")]
+fn load_assets(
+    path: &Path,
+    project: &OpenedPath,
+    directories: &mut HashMap<FileIdentity, PathBuf>,
+    files: &mut HashMap<FileIdentity, PathBuf>,
+    budget: &mut LoadBudget,
+) -> Result<Vec<LoadedProjectAsset>, CheckFailure> {
+    let assets_path = path.join("assets");
+    let root = match open_beneath(
+        project.fd(),
+        Path::new("assets"),
+        &assets_path,
+        true,
+        budget,
+    ) {
+        Err(CheckFailure::Inspect { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        result => result?,
+    };
+    if let Some(first) = directories.insert(identity(&root), assets_path.clone()) {
+        return Err(CheckFailure::AliasedInputPaths {
+            first,
+            second: assets_path,
+        });
+    }
+    let mut assets = Vec::new();
+    let mut pending = vec![(PathBuf::new(), identity(&root), 0_usize)];
+    while let Some((relative_dir, expected, depth)) = pending.pop() {
+        let display = assets_path.join(&relative_dir);
+        let directory = reopen_directory(
+            root.fd(),
+            if relative_dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                &relative_dir
+            },
+            &display,
+            expected,
+            budget,
+        )?;
+        budget.charge_work()?;
+        let entries = linux_fd::read_directory(&directory, |name| {
+            budget.charge_entry()?;
+            budget.charge_work()?;
+            if name.to_str().is_none() {
+                return Err(CheckFailure::InvalidPathEncoding {
+                    path: display.join(name),
+                });
+            }
+            Ok(())
+        })
+        .map_err(|error| match error {
+            linux_fd::ReadDirectoryError::Io(source) => CheckFailure::Read {
+                path: display.clone(),
+                source,
+            },
+            linux_fd::ReadDirectoryError::Admission(error) => error,
+        })?;
+        for name in entries {
+            let relative = relative_dir.join(&name);
+            let display = assets_path.join(&relative);
+            let opened = open_beneath(directory.fd(), Path::new(&name), &display, false, budget)?;
+            // Markdown is local documentation (ignored by the published
+            // repositories). Still inspect the inode before excluding it so
+            // symlinks cannot bypass traversal rules by using a .md suffix.
+            if file_type(&opened) == FileType::Regular
+                && display.extension() == Some(OsStr::new("md"))
+            {
+                continue;
+            }
+            match file_type(&opened) {
+                FileType::Directory => {
+                    if depth >= budget.limits.max_directory_depth {
+                        return Err(CheckFailure::DirectoryDepth {
+                            path: display,
+                            limit: budget.limits.max_directory_depth,
+                        });
+                    }
+                    if let Some(first) = directories.insert(identity(&opened), display.clone()) {
+                        return Err(CheckFailure::AliasedInputPaths {
+                            first,
+                            second: display,
+                        });
+                    }
+                    pending.push((relative, identity(&opened), depth + 1));
+                }
+                FileType::Regular => {
+                    if let Some(first) = files.insert(identity(&opened), display.clone()) {
+                        return Err(CheckFailure::AliasedSourceFiles {
+                            first,
+                            second: display,
+                        });
+                    }
+                    let digest = hash_asset(opened, &display, budget)?;
+                    assets.push(LoadedProjectAsset {
+                        relative_path: Path::new("assets").join(relative),
+                        size: digest.1,
+                        digest: digest.0,
+                    });
+                }
+                FileType::Other => return Err(CheckFailure::InvalidAssetFile { path: display }),
+            }
+        }
+    }
+    assets.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(assets)
+}
+
+#[cfg(target_os = "linux")]
+fn hash_asset(
+    opened: OpenedPath,
+    path: &Path,
+    budget: &mut LoadBudget,
+) -> Result<([u8; 32], u64), CheckFailure> {
+    let mut hasher = Sha256::new();
+    let mut reader = opened.into_file();
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut size = 0_u64;
+    loop {
+        budget.charge_work()?;
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|source| CheckFailure::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        budget.reserve_bytes(read)?;
+        size += read as u64;
+        hasher.update(&buffer[..read]);
+    }
+    Ok((hasher.finalize().into(), size))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_child_lock(
+    project: &LoadedProject,
+    expected: &crate::lock::LockManifest,
+) -> Result<crate::lock::LockManifest, CheckFailure> {
+    let path = project.path();
+    let invalid = |reason: String| CheckFailure::InvalidChildLock {
         path: path.to_path_buf(),
-        root: project,
-        sources,
-        main_source,
-        inputs: retained_inputs,
-    })
+        reason,
+    };
+    let actual = super::read_lock(project)
+        .map_err(|error| invalid(error.to_string()))?
+        .ok_or_else(|| CheckFailure::MissingChildLock {
+            path: path.to_path_buf(),
+            name: crate::LOCK_FILE_NAME,
+        })?;
+    super::compare_lock(&actual, expected).map_err(|error| invalid(error.to_string()))?;
+    Ok(actual)
+}
+
+#[cfg(target_os = "linux")]
+fn open_child_root(
+    project: &OpenedPath,
+    path: &Path,
+    relative: &Path,
+    display: &Path,
+    budget: &mut LoadBudget,
+) -> Result<OpenedPath, CheckFailure> {
+    // Revalidate the visible root without symlinks, then resolve its parent
+    // through the pinned descriptor. A root spelled `.` has no basename.
+    let pinned = open_top(path, budget)?;
+    if identity(&pinned) != identity(project) {
+        return Err(CheckFailure::ChildProjectCycle {
+            path: path.to_path_buf(),
+        });
+    }
+    budget.charge_work()?;
+    let parent = linux_fd::open_project_parent(project.fd())
+        .map_err(|source| open_error(&path.join(".."), source))?;
+    budget.charge_work()?;
+    let child = open_beneath(parent.fd(), relative, display, true, budget)?;
+    if file_type(&child) != FileType::Directory {
+        return Err(CheckFailure::InputNotDirectory {
+            path: display.to_path_buf(),
+        });
+    }
+    Ok(child)
+}
+
+#[cfg(target_os = "linux")]
+fn graft_child(
+    sources: &mut SourceSet,
+    parent: SourceDomainId,
+    alias: &str,
+    child: &LoadedProject,
+    budget: &mut LoadBudget,
+    grafts: &mut HashMap<FileIdentity, SourceDomainId>,
+) -> Result<(), CheckFailure> {
+    budget.charge_work()?;
+    let child_identity = identity(&child.root);
+    if let Some(&domain) = grafts.get(&child_identity) {
+        sources.bind_project_domain(parent, alias, domain)?;
+        return Ok(());
+    }
+    let domain = sources.create_project_domain(parent, alias)?;
+    grafts.insert(child_identity, domain);
+    sources.add_to_project_domain(
+        domain,
+        child.main_source().name(),
+        child.main_source().text(),
+    )?;
+    for input in child.inputs() {
+        let target = sources.create_child_input_domain(domain, input.name())?;
+        for file in input.files() {
+            let source = child
+                .sources()
+                .get(file.source_id())
+                .expect("pinned child source");
+            let name = source.name();
+            if input.locator().starts_with("modules:") {
+                let mut module = file
+                    .relative_path()
+                    .iter()
+                    .map(|part| part.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                let file_name = module.pop().expect("source has file name");
+                let stem = file_name.strip_suffix(".srx").expect("source is .srx");
+                if stem != "package" || module.is_empty() {
+                    module.push(stem.to_owned());
+                }
+                sources.add_to_input_module(target, name, source.text(), module)?;
+            } else {
+                sources.add_to_input_domain(target, name, source.text())?;
+            }
+        }
+    }
+    for (alias, grandchild) in &child.children {
+        graft_child(sources, domain, alias, grandchild, budget, grafts)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
 fn validate_input_paths(
     project_path: &Path,
-    locators: &[(String, PathBuf)],
+    locators: &[InputLocator],
     budget: &mut LoadBudget,
 ) -> Result<(), CheckFailure> {
-    for (index, (_, relative)) in locators.iter().enumerate() {
+    for (index, locator) in locators.iter().enumerate() {
+        let relative = &locator.relative;
         budget.charge_work()?;
-        let display = project_path.join(relative);
+        let display = if locator.child {
+            project_path.join("..").join(relative)
+        } else {
+            project_path.join(relative)
+        };
         if relative.as_os_str().is_empty() {
             return Err(CheckFailure::AliasedInputPaths {
                 first: project_path.to_path_buf(),
                 second: display,
             });
         }
-        for (_, existing) in &locators[..index] {
+        for existing in &locators[..index] {
             budget.charge_work()?;
-            if relative.starts_with(existing) || existing.starts_with(relative) {
+            if locator.child == existing.child
+                && (relative.starts_with(&existing.relative)
+                    || existing.relative.starts_with(relative))
+            {
+                let first = if existing.child {
+                    project_path.join("..").join(&existing.relative)
+                } else {
+                    project_path.join(&existing.relative)
+                };
                 return Err(CheckFailure::AliasedInputPaths {
-                    first: project_path.join(existing),
+                    first,
                     second: display,
                 });
             }

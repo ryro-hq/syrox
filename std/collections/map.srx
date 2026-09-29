@@ -1,0 +1,123 @@
+mod std::maps {
+    value MapKey(str);
+
+    enum MapEntry<T> {
+        Entry(MapKey, T),
+    }
+
+    opaque struct OrderedMap<T> {
+        entries: [MapEntry<T>];
+    }
+
+    enum Insertion<T> {
+        Pending(MapKey, T, [MapEntry<T>]),
+        Placed([MapEntry<T>]),
+        Duplicate(MapKey),
+    }
+
+    pub fn map_empty<T>() -> OrderedMap<T> {
+        OrderedMap<T> { entries = []; }
+    }
+
+    // Ordering is lexicographic UTF-8 bytes. Insertion never overwrites a key.
+    pub fn map_insert<T>(
+        items: OrderedMap<T>,
+        key: MapKey,
+        item: T,
+    ) -> Result<OrderedMap<T>, MapKey> {
+        let inserted = fold(
+            items.entries,
+            Insertion::Pending<T>(key, item, []),
+            fn(state: Insertion<T>, entry: MapEntry<T>) -> Insertion<T> {
+                match state {
+                    Pending(key, item, acc) => match entry {
+                        Entry(existing, element) => compare(
+                            key,
+                            existing,
+                            Insertion::Placed(acc ++ [
+                                MapEntry::Entry(key, item),
+                                MapEntry::Entry(existing, element),
+                            ]),
+                            Insertion::Duplicate(key),
+                            Insertion::Pending(
+                                key,
+                                item,
+                                acc ++ [MapEntry::Entry(existing, element)],
+                            ),
+                        ),
+                    },
+                    Placed(acc) => Insertion::Placed(acc ++ [entry]),
+                    Duplicate(key) => Insertion::Duplicate(key),
+                }
+            },
+        );
+
+        match inserted {
+            Pending(key, item, acc) => Result::Ok(OrderedMap<T> {
+                entries = acc ++ [MapEntry::Entry(key, item)];
+            }),
+            Placed(entries) => Result::Ok(OrderedMap<T> { entries = entries; }),
+            Duplicate(key) => Result::Err(key),
+        }
+    }
+
+    pub fn map_from_entries<T>(entries: [MapEntry<T>]) -> Result<OrderedMap<T>, MapKey> {
+        fold(
+            entries,
+            Result::Ok<OrderedMap<T>, MapKey>(map_empty<T>()),
+            fn(state: Result<OrderedMap<T>, MapKey>, entry: MapEntry<T>) -> Result<OrderedMap<T>, MapKey> {
+                match state {
+                    Ok(items) => match entry {
+                        Entry(key, item) => map_insert(items, key, item),
+                    },
+                    Err(key) => Result::Err(key),
+                }
+            },
+        )
+    }
+
+    // Lookup consumes an affine map; reusable maps remain reusable values.
+    pub fn map_get<T>(items: OrderedMap<T>, key: MapKey) -> Option<T> {
+        fold(
+            items.entries,
+            Option::None<T>(),
+            fn(found: Option<T>, entry: MapEntry<T>) -> Option<T> {
+                match found {
+                    Some(item) => Option::Some(item),
+                    None => match entry {
+                        Entry(existing, item) => compare(
+                            key,
+                            existing,
+                            Option::None(),
+                            Option::Some(item),
+                            Option::None(),
+                        ),
+                    },
+                }
+            },
+        )
+    }
+
+    pub fn map_entries<T>(items: OrderedMap<T>) -> [MapEntry<T>] {
+        items.entries
+    }
+
+    pub fn map_merge<T>(
+        left: OrderedMap<T>,
+        right: OrderedMap<T>,
+    ) -> Result<OrderedMap<T>, MapKey> {
+        map_from_entries(left.entries ++ right.entries)
+    }
+
+    pub fn map_keys<T>(items: OrderedMap<T>) -> [MapKey] {
+        map(items.entries, fn(entry: MapEntry<T>) -> MapKey {
+            match entry { Entry(key, _) => key }
+        })
+    }
+
+    pub fn map_values<T>(items: OrderedMap<T>) -> [T] {
+        map(items.entries, fn(entry: MapEntry<T>) -> T {
+            match entry { Entry(_, item) => item }
+        })
+    }
+}

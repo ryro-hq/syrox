@@ -5,9 +5,16 @@ use syrox_lang::{ItemKind, ParsedSources, StringPart};
 
 use super::CheckFailure;
 
+pub(super) struct InputLocator {
+    pub(super) name: String,
+    pub(super) relative: PathBuf,
+    pub(super) modules: bool,
+    pub(super) child: bool,
+}
+
 pub(super) fn root_input_locators(
     parsed: &ParsedSources,
-) -> Result<Vec<(String, PathBuf)>, CheckFailure> {
+) -> Result<Vec<InputLocator>, CheckFailure> {
     let mut names = HashSet::new();
     let mut locators = Vec::new();
     let main = parsed
@@ -31,14 +38,39 @@ pub(super) fn root_input_locators(
                     locator: input.value.source.clone(),
                 }
             })?;
-            let Some(relative) = locator.strip_prefix("path:") else {
-                return Err(CheckFailure::UnsupportedLocator {
+            let (relative, modules, child) =
+                if let Some(relative) = locator.strip_prefix("path:../") {
+                    (relative, false, true)
+                } else if let Some(relative) = locator.strip_prefix("path:") {
+                    (relative, false, false)
+                } else if let Some(relative) = locator.strip_prefix("modules:") {
+                    (relative, true, false)
+                } else {
+                    return Err(CheckFailure::UnsupportedLocator {
+                        name: input.name.text.clone(),
+                        locator,
+                    });
+                };
+            let original = Path::new(relative);
+            let relative = normalize_relative_input(&input.name.text, original)?;
+            if child && original.as_os_str() != relative.as_os_str() {
+                return Err(CheckFailure::UnsafeInputPath {
                     name: input.name.text.clone(),
-                    locator,
+                    path: original.to_path_buf(),
                 });
-            };
-            let relative = normalize_relative_input(&input.name.text, Path::new(relative))?;
-            locators.push((input.name.text.clone(), relative));
+            }
+            if child && relative.as_os_str().is_empty() {
+                return Err(CheckFailure::UnsafeInputPath {
+                    name: input.name.text.clone(),
+                    path: PathBuf::from(".."),
+                });
+            }
+            locators.push(InputLocator {
+                name: input.name.text.clone(),
+                relative,
+                modules,
+                child,
+            });
         }
     }
     Ok(locators)

@@ -1,7 +1,6 @@
 use super::{
     AuthenticatedStandardLibrary, BTreeMap, BTreeSet, CanonicalType, PlanBuild, PlanError,
-    PlanPackage, PlanPackageId, ProjectionBudget, RealizedProgram, Value, decode_package_id,
-    exact_nominal,
+    PlanPackage, PlanPackageId, ProjectionBudget, Value, decode_package_id, exact_nominal,
 };
 
 const APPLICATION_PATH: &[&str] = &["std", "pkg", "Application"];
@@ -31,7 +30,7 @@ impl PlanApplication {
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn extract(
-    realized: &RealizedProgram,
+    components: &[super::recipes::Component<'_>],
     packages: &[PlanPackage],
     builds: &[PlanBuild],
     standard_library: Option<&AuthenticatedStandardLibrary>,
@@ -40,13 +39,12 @@ pub(super) fn extract(
     if standard_library.is_none() {
         return Ok((Vec::new(), None));
     }
-    let mut roots: Vec<_> = realized
-        .roots()
+    let mut roots: Vec<_> = components
+        .iter()
         .filter(|root| {
             root.identity().domain() == syrox_lang::SourceDomainId::project()
-                && root.ty().is_some_and(|ty| {
-                    exact_nominal(ty, APPLICATION_PATH) || exact_nominal(ty, DEFAULT_PATH)
-                })
+                && (exact_nominal(root.ty(), APPLICATION_PATH)
+                    || exact_nominal(root.ty(), DEFAULT_PATH))
         })
         .collect();
     roots.sort_by(|left, right| left.identity().cmp(right.identity()));
@@ -72,7 +70,7 @@ pub(super) fn extract(
             root: name.clone(),
             reason,
         };
-        let Some(Value::Struct { ty, fields }) = root.value() else {
+        let Value::Struct { ty, fields, .. } = root.value() else {
             return Err(invalid("expected an exact std application struct"));
         };
         let is_default = exact_nominal(ty, DEFAULT_PATH);
@@ -186,7 +184,7 @@ fn decode_role(
     let mut result = budget.collection::<PlanPackageId>(items.len())?;
     for item in items {
         budget.node::<PlanPackageId>()?;
-        let Value::Struct { ty, fields } = item else {
+        let Value::Struct { ty, fields, .. } = item else {
             return Err(invalid("runtime provider is not a struct"));
         };
         if !exact_nominal(ty, path) || fields.len() != 1 || fields[0].0 != "package" {

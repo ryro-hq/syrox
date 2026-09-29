@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     mem::size_of,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -18,6 +18,10 @@ use crate::{
     StringLiteral, StringPart, Ty,
 };
 
+mod memo;
+pub(super) use memo::MemoArena;
+pub use memo::MemoId;
+
 #[derive(Clone)]
 struct OpenScope {
     name: Option<Arc<str>>,
@@ -27,6 +31,15 @@ struct OpenScope {
 pub(super) struct Halt;
 pub(super) type Eval<T> = Result<T, Halt>;
 
+pub(super) struct CachedOutput {
+    value: Value,
+    shareable: bool,
+}
+
+// Calls use several evaluator frames per expression. Fold releases each call
+// before the next item, independently of this native-stack protection.
+const MAX_CALL_DEPTH: usize = 32;
+
 pub(super) struct Evaluator<'a> {
     pub(super) checked: &'a CheckedProgram,
     policy: &'a CheckPolicy,
@@ -34,19 +47,56 @@ pub(super) struct Evaluator<'a> {
     pub(super) index: &'a ProgramIndex<'a>,
     pub(super) limits: EvaluationLimits,
     root: Arc<CanonicalItemIdentity>,
+    project_context: crate::SourceDomainId,
     pub(super) diagnostics: Vec<Diagnostic>,
     locals: BTreeMap<LocalId, Value>,
+    active_outputs: BTreeSet<ItemId>,
+    memo_outputs: BTreeMap<ItemId, CachedOutput>,
+    pub(super) memos: MemoArena,
     scopes: Vec<OpenScope>,
     pub(super) claims: BTreeMap<ResourceClaimKey, Span>,
+    // Includes reads of root-scoped cached outputs, whose claims were already
+    // recorded. A reusable payload alone does not imply a pure computation.
+    claim_effects: usize,
     pub(super) canonical_types: BTreeMap<Ty, Arc<CanonicalType>>,
     next_boundary: u64,
     pub(super) steps: usize,
     depth: usize,
+    call_depth: usize,
     pub(super) expansion: usize,
     pub(super) operation_error: Option<EvaluationSetupError>,
 }
 
 impl<'a> Evaluator<'a> {
+    fn enter_call(&mut self, span: Span) -> Eval<()> {
+        if self.call_depth >= MAX_CALL_DEPTH.min(self.limits.max_depth) {
+            return self.fail(span, "function call depth limit reached");
+        }
+        self.call_depth += 1;
+        Ok(())
+    }
+
+    fn enter_project_context(&mut self, span: Span) -> crate::SourceDomainId {
+        let previous = self.project_context;
+        // A std helper acts on behalf of its caller; a project function or
+        // imported output changes the current asset authority to its owner.
+        if let Some(owner) = self.checked.resolved().parsed().owner(span.source_id()) {
+            self.project_context = owner;
+        }
+        previous
+    }
+
+    pub(super) fn inherit_outputs(&mut self, outputs: BTreeMap<ItemId, CachedOutput>) {
+        self.memo_outputs = outputs;
+    }
+
+    pub(super) fn take_shareable_outputs(&mut self) -> BTreeMap<ItemId, CachedOutput> {
+        // A later sibling failure or claim cannot change an already completed
+        // claim-free value. Retaining it also preserves lazy instance identity.
+        self.memo_outputs.retain(|_, output| output.shareable);
+        std::mem::take(&mut self.memo_outputs)
+    }
+
     pub(super) fn new(
         checked: &'a CheckedProgram,
         policy: &'a CheckPolicy,
@@ -66,18 +116,24 @@ impl<'a> Evaluator<'a> {
             index,
             limits,
             root,
+            project_context: crate::SourceDomainId::project(),
             diagnostics: Vec::new(),
             locals: BTreeMap::new(),
+            active_outputs: BTreeSet::new(),
+            memo_outputs: BTreeMap::new(),
+            memos: MemoArena::default(),
             scopes: if scopes_fit {
                 Vec::with_capacity(scope_count)
             } else {
                 Vec::new()
             },
             claims: BTreeMap::new(),
+            claim_effects: 0,
             canonical_types: BTreeMap::new(),
             next_boundary: 0,
             steps: 0,
             depth: 0,
+            call_depth: 0,
             expansion: scope_bytes,
             operation_error: None,
         };
@@ -149,7 +205,9 @@ impl<'a> Evaluator<'a> {
 
     pub(super) fn error(&mut self, span: Span, message: impl Into<String>) {
         if self.diagnostics.len() < self.limits.max_diagnostics {
-            self.diagnostics.push(Diagnostic::error(message, span));
+            self.diagnostics.push(
+                Diagnostic::error(message, span).with_code(crate::DiagnosticCode::Evaluation),
+            );
         }
     }
 
@@ -202,29 +260,176 @@ impl<'a> Evaluator<'a> {
                 }
             }
             ExpressionKind::Path(path) => match metadata.elaboration() {
-                Some(Elaboration::ContextualVariant { enumeration, index }) => Ok(Value::Variant {
-                    ty: self.canonical_ty(&Ty::Nominal(*enumeration), substitutions, path.span)?,
+                Some(Elaboration::ContextualVariant { index, .. }) => Ok(Value::Variant {
+                    ty: self.canonical_ty(metadata.ty(), substitutions, path.span)?,
                     index: *index,
+                    payload: Vec::new(),
                 }),
                 _ => match self.index.target(path.span) {
                     Some(ResolvedTarget::Local(local)) => self.local_value(*local, path.span),
-                    Some(ResolvedTarget::EnumVariant { enumeration, index }) => {
-                        Ok(Value::Variant {
-                            ty: self.canonical_ty(
-                                &Ty::Nominal(*enumeration),
-                                substitutions,
-                                path.span,
-                            )?,
-                            index: *index,
+                    Some(ResolvedTarget::Item(item)) if self.index.functions.contains_key(item) => {
+                        let supplied = match metadata.elaboration() {
+                            Some(Elaboration::FunctionSpecialization {
+                                substitutions: supplied,
+                            }) => self.substitute_bindings(supplied, substitutions, path.span)?,
+                            _ => BTreeMap::new(),
+                        };
+                        Ok(Value::Function {
+                            item: *item,
+                            substitutions: supplied,
+                            ty: self.canonical_ty(metadata.ty(), substitutions, path.span)?,
                         })
                     }
+                    Some(ResolvedTarget::Item(item))
+                        if self.index.output_values.contains_key(item) =>
+                    {
+                        self.output_value(*item, path.span)
+                    }
+                    Some(ResolvedTarget::EnumVariant { index, .. }) => Ok(Value::Variant {
+                        ty: self.canonical_ty(metadata.ty(), substitutions, path.span)?,
+                        index: *index,
+                        payload: Vec::new(),
+                    }),
                     _ => self.fail(path.span, "checked value path has no evaluable target"),
                 },
             },
             ExpressionKind::Call { callee, arguments } => {
                 self.call(callee.span, arguments, substitutions, expression.span)
             }
-            ExpressionKind::Struct { fields, .. } => {
+            ExpressionKind::Specialize { function, .. } => {
+                if let Some(Elaboration::VariantConstructor { index }) = metadata.elaboration() {
+                    return Ok(Value::VariantConstructor {
+                        ty: self.canonical_ty(metadata.ty(), substitutions, expression.span)?,
+                        index: *index,
+                    });
+                }
+                let Some(ResolvedTarget::Item(item)) = self.index.target(function.span).cloned()
+                else {
+                    return self.fail(expression.span, "missing generic function target");
+                };
+                let Some(Elaboration::FunctionSpecialization {
+                    substitutions: supplied,
+                }) = metadata.elaboration()
+                else {
+                    return self.fail(expression.span, "missing function specialization metadata");
+                };
+                let specialized =
+                    self.substitute_bindings(supplied, substitutions, expression.span)?;
+                Ok(Value::Function {
+                    item,
+                    ty: self.canonical_ty(metadata.ty(), substitutions, expression.span)?,
+                    substitutions: specialized,
+                })
+            }
+            ExpressionKind::Apply { callee, arguments } => {
+                let callable = self.expression(callee, substitutions)?;
+                self.call_value(
+                    callable,
+                    callee.span,
+                    arguments,
+                    substitutions,
+                    expression.span,
+                )
+            }
+            ExpressionKind::ModuleExports { mapper, .. } => {
+                self.module_exports(mapper, substitutions, expression.span)
+            }
+            ExpressionKind::Memoize(value) => {
+                let callable = self.expression(value, substitutions)?;
+                self.memoize(callable, expression.span)
+            }
+            ExpressionKind::Compare {
+                left,
+                right,
+                branches,
+            } => {
+                let left = self.expression(left, substitutions)?;
+                let right = self.expression(right, substitutions)?;
+                let index = self.compare_values(left, right, expression.span)?;
+                self.expression(&branches[index], substitutions)
+            }
+            ExpressionKind::Fold {
+                items,
+                initial,
+                step,
+            } => {
+                let Value::List { items, .. } = self.expression(items, substitutions)? else {
+                    return self.fail(expression.span, "checked fold input is not a list");
+                };
+                let mut accumulator = self.expression(initial, substitutions)?;
+                let callback = self.expression(step, substitutions)?;
+                for item in items {
+                    self.tick(expression.span)?;
+                    self.expand(2 * size_of::<Value>(), expression.span)?;
+                    let callable = Self::copy_value_ref(self, &callback, step.span, 0)?;
+                    accumulator =
+                        self.invoke_value(callable, vec![accumulator, item], expression.span)?;
+                }
+                Ok(accumulator)
+            }
+            ExpressionKind::Closure {
+                parameters,
+                body,
+                once,
+                ..
+            } => {
+                let referenced = self.index.locals_referenced_in(expression.span).count();
+                self.charge_steps(referenced, expression.span)?;
+                self.expand(
+                    referenced.saturating_mul(size_of::<LocalId>()),
+                    expression.span,
+                )?;
+                let referenced: BTreeSet<_> =
+                    self.index.locals_referenced_in(expression.span).collect();
+                self.expand(
+                    body.span.end().saturating_sub(body.span.start()) as usize * 32,
+                    expression.span,
+                )?;
+                let mut captures = Vec::new();
+                for local in referenced {
+                    if self.locals.contains_key(&local) {
+                        self.expand(size_of::<(LocalId, Value)>(), expression.span)?;
+                        let value = if *once {
+                            self.local_value(local, expression.span)?
+                        } else {
+                            self.copy_value(local, expression.span)?
+                        };
+                        captures.push((local, value));
+                    }
+                }
+                self.expand(
+                    parameters.len().saturating_mul(size_of::<LocalId>()),
+                    expression.span,
+                )?;
+                let parameters = parameters
+                    .iter()
+                    .map(|parameter| self.index.local(parameter.name.span).ok_or(Halt))
+                    .collect::<Eval<Vec<_>>>()?;
+                Ok(Value::Closure {
+                    once: *once,
+                    owner: self
+                        .checked
+                        .resolved()
+                        .parsed()
+                        .owner(expression.span.source_id())
+                        .unwrap_or(self.project_context),
+                    substitutions: self.substitute_bindings(
+                        substitutions,
+                        &BTreeMap::new(),
+                        expression.span,
+                    )?,
+                    ty: self.canonical_ty(metadata.ty(), substitutions, expression.span)?,
+                    body: Arc::new(body.clone()),
+                    parameters,
+                    captures,
+                })
+            }
+            ExpressionKind::Struct {
+                fields, recovery, ..
+            } => {
+                if !recovery.is_empty() {
+                    return self.fail(expression.span, "recovered struct cannot be evaluated");
+                }
                 let checked_ty =
                     self.substitute_ty(metadata.ty(), substitutions, expression.span)?;
                 let item = nominal_head(&checked_ty).ok_or_else(|| {
@@ -265,12 +470,12 @@ impl<'a> Evaluator<'a> {
             }
             ExpressionKind::Match { value, arms } => {
                 let scrutinee = self.expression(value, substitutions)?;
-                let Value::Variant { ty, index } = scrutinee else {
+                let Value::Variant { ty, index, payload } = scrutinee else {
                     return self.fail(value.span, "checked match produced a non-variant value");
                 };
                 for arm in arms {
                     if self.pattern_matches(arm, &ty, index)? {
-                        return self.expression(&arm.value, substitutions);
+                        return self.match_payload(arm, payload, substitutions);
                     }
                 }
                 self.fail(expression.span, "checked match selected no arm")
@@ -301,6 +506,66 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    pub(super) fn root_value(&mut self, item: ItemId, expression: &Expression) -> Eval<Value> {
+        if self.memo_outputs.contains_key(&item) {
+            return self.output_value(item, expression.span);
+        }
+        self.expand(size_of::<ItemId>(), expression.span)?;
+        self.active_outputs.insert(item);
+        let claim_effects = self.claim_effects;
+        let result = self.expression(expression, &BTreeMap::new());
+        self.active_outputs.remove(&item);
+        let value = result?;
+        if !value.affine() && self.claim_effects == claim_effects && self.diagnostics.is_empty() {
+            self.expand(size_of::<(ItemId, CachedOutput)>(), expression.span)?;
+            let copy = Self::copy_value_ref(self, &value, expression.span, 0)?;
+            self.memo_outputs.insert(
+                item,
+                CachedOutput {
+                    value: copy,
+                    shareable: true,
+                },
+            );
+        }
+        Ok(value)
+    }
+
+    fn output_value(&mut self, item: ItemId, span: Span) -> Eval<Value> {
+        if let Some(output) = self.memo_outputs.remove(&item) {
+            if !output.shareable {
+                self.claim_effects = self.claim_effects.saturating_add(1);
+            }
+            let result = Self::copy_value_ref(self, &output.value, span, 0);
+            self.memo_outputs.insert(item, output);
+            return result;
+        }
+        if self.active_outputs.contains(&item) {
+            return self.fail(span, "cycle in imported value outputs");
+        }
+        self.expand(size_of::<ItemId>(), span)?;
+        self.active_outputs.insert(item);
+        let value = self.index.output_values.get(&item).copied().ok_or(Halt)?;
+        let previous = self.enter_project_context(value.span);
+        let claim_effects = self.claim_effects;
+        let result = self.expression(value, &BTreeMap::new());
+        self.project_context = previous;
+        self.active_outputs.remove(&item);
+        let value = result?;
+        if value.affine() {
+            return self.fail(
+                span,
+                "imported value output cannot carry an affine resource",
+            );
+        }
+        self.expand(size_of::<(ItemId, CachedOutput)>(), span)?;
+        let copy = Self::copy_value_ref(self, &value, span, 0);
+        let shareable =
+            copy.is_ok() && self.claim_effects == claim_effects && self.diagnostics.is_empty();
+        self.memo_outputs
+            .insert(item, CachedOutput { value, shareable });
+        copy
+    }
+
     fn call(
         &mut self,
         callee_span: Span,
@@ -308,14 +573,163 @@ impl<'a> Evaluator<'a> {
         substitutions: &BTreeMap<LocalId, Ty>,
         span: Span,
     ) -> Eval<Value> {
-        let Some(ResolvedTarget::Item(item)) = self.index.target(callee_span).cloned() else {
-            return self.fail(callee_span, "checked call has no item target");
+        let item = match self.index.target(callee_span).cloned() {
+            Some(ResolvedTarget::EnumVariant { index, .. }) => {
+                let payload = self.evaluate_arguments(arguments, substitutions, span)?;
+                let ty = self.checked.expression(span).ok_or(Halt)?.ty();
+                let ty = self.canonical_ty(ty, substitutions, span)?;
+                return self.construct_variant(ty, index, payload, span);
+            }
+            Some(ResolvedTarget::Item(item)) if self.index.output_values.contains_key(&item) => {
+                let callable = self.output_value(item, callee_span)?;
+                return self.call_value(callable, callee_span, arguments, substitutions, span);
+            }
+            Some(ResolvedTarget::Item(item)) => item,
+            Some(ResolvedTarget::Local(local)) => {
+                let callable = self.local_value(local, callee_span)?;
+                return self.call_value(callable, callee_span, arguments, substitutions, span);
+            }
+            _ => return self.fail(callee_span, "checked call has no item target"),
         };
+        let supplied = match self
+            .checked
+            .expression(span)
+            .and_then(|metadata| metadata.elaboration())
+        {
+            Some(Elaboration::FunctionSpecialization {
+                substitutions: supplied,
+            }) => self.substitute_bindings(supplied, substitutions, span)?,
+            _ => BTreeMap::new(),
+        };
+        self.call_item(item, callee_span, arguments, substitutions, &supplied, span)
+    }
+
+    fn call_value(
+        &mut self,
+        callable: Value,
+        callee_span: Span,
+        arguments: &[Expression],
+        substitutions: &BTreeMap<LocalId, Ty>,
+        span: Span,
+    ) -> Eval<Value> {
+        let values = self.evaluate_arguments(arguments, substitutions, span)?;
+        self.invoke_value(callable, values, callee_span)
+    }
+
+    fn evaluate_arguments(
+        &mut self,
+        arguments: &[Expression],
+        substitutions: &BTreeMap<LocalId, Ty>,
+        span: Span,
+    ) -> Eval<Vec<Value>> {
         self.expand(arguments.len().saturating_mul(size_of::<Value>()), span)?;
-        let mut values = Vec::with_capacity(arguments.len());
-        for argument in arguments {
-            values.push(self.expression(argument, substitutions)?);
+        arguments
+            .iter()
+            .map(|argument| self.expression(argument, substitutions))
+            .collect()
+    }
+
+    fn invoke_value(&mut self, callable: Value, values: Vec<Value>, span: Span) -> Eval<Value> {
+        match callable {
+            Value::MemoizedFunction { id, .. } => {
+                if !values.is_empty() {
+                    return self.fail(span, "memoized function received arguments");
+                }
+                self.force_memo(&id, span)
+            }
+            Value::VariantConstructor { ty, index } => {
+                let CanonicalType::Function {
+                    parameters, result, ..
+                } = ty.as_ref()
+                else {
+                    return self.fail(span, "variant constructor has no function type");
+                };
+                if values.len() != parameters.len() {
+                    return self.fail(span, "variant constructor arity mismatch");
+                }
+                self.construct_variant(result.clone(), index, values, span)
+            }
+            Value::Function {
+                item,
+                substitutions: supplied,
+                ..
+            } => self.invoke_item(item, values, &supplied, span),
+            Value::Closure {
+                body,
+                owner,
+                parameters,
+                captures,
+                substitutions: supplied,
+                ..
+            } => {
+                if values.len() != parameters.len() {
+                    return self.fail(span, "closure call has invalid checked arity");
+                }
+                self.expand(
+                    captures
+                        .len()
+                        .saturating_add(values.len())
+                        .saturating_mul(size_of::<(LocalId, Option<Value>)>()),
+                    span,
+                )?;
+                let mut bound = Vec::new();
+                for (local, value) in captures
+                    .into_iter()
+                    .chain(parameters.into_iter().zip(values))
+                {
+                    bound.push((local, self.locals.insert(local, value)));
+                }
+                self.enter_call(span)?;
+                let previous_context = std::mem::replace(&mut self.project_context, owner);
+                let result = self.block(&body, &supplied);
+                self.call_depth -= 1;
+                self.project_context = previous_context;
+                for (local, previous) in bound.into_iter().rev() {
+                    self.locals.remove(&local);
+                    if let Some(previous) = previous {
+                        self.locals.insert(local, previous);
+                    }
+                }
+                result
+            }
+            _ => self.fail(span, "checked callee is not a function value"),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_item(
+        &mut self,
+        item: ItemId,
+        callee_span: Span,
+        arguments: &[Expression],
+        substitutions: &BTreeMap<LocalId, Ty>,
+        supplied: &BTreeMap<LocalId, Ty>,
+        span: Span,
+    ) -> Eval<Value> {
+        let values = self.evaluate_arguments(arguments, substitutions, span)?;
+        self.invoke_item(item, values, supplied, callee_span)
+    }
+
+    fn invoke_item(
+        &mut self,
+        item: ItemId,
+        values: Vec<Value>,
+        supplied: &BTreeMap<LocalId, Ty>,
+        span: Span,
+    ) -> Eval<Value> {
+        self.enter_call(span)?;
+        let result = self.invoke_item_inner(item, values, supplied, span);
+        self.call_depth -= 1;
+        result
+    }
+
+    fn invoke_item_inner(
+        &mut self,
+        item: ItemId,
+        mut values: Vec<Value>,
+        supplied: &BTreeMap<LocalId, Ty>,
+        span: Span,
+    ) -> Eval<Value> {
         if self.index.primitives.contains_key(&item) {
             if values.len() != 1 {
                 return self.fail(span, "primitive constructor has invalid checked arity");
@@ -327,10 +741,10 @@ impl<'a> Evaluator<'a> {
                     return self.fail(span, "primitive constructor received a non-primitive value");
                 }
             };
-            return self.construct_primitive(item, primitive, callee_span, true);
+            return self.construct_primitive(item, primitive, span, true);
         }
         let Some(function) = self.index.functions.get(&item).copied() else {
-            return self.fail(callee_span, "checked function target is unavailable");
+            return self.fail(span, "checked function target is unavailable");
         };
         if values.len() != function.parameters.len() {
             return self.fail(span, "function call has invalid checked arity");
@@ -351,7 +765,9 @@ impl<'a> Evaluator<'a> {
             };
             bound.push((local, self.locals.insert(local, value)));
         }
-        let result = self.block(&function.body, &BTreeMap::new());
+        let previous_context = self.enter_project_context(function.body.span);
+        let result = self.block(&function.body, supplied);
+        self.project_context = previous_context;
         for (local, previous) in bound {
             self.locals.remove(&local);
             if let Some(previous) = previous {
@@ -367,7 +783,11 @@ impl<'a> Evaluator<'a> {
             for statement in &block.statements {
                 self.tick(statement.span)?;
                 match &statement.kind {
-                    StatementKind::Let { name, value } => {
+                    StatementKind::Recovery { .. } => {
+                        return self
+                            .fail(statement.span, "recovered statement cannot be evaluated");
+                    }
+                    StatementKind::Let { name, value, .. } => {
                         let value = self.expression(value, substitutions)?;
                         let Some(local) = self.index.local(name.span) else {
                             return self.fail(name.span, "missing checked let identity");
@@ -411,70 +831,135 @@ impl<'a> Evaluator<'a> {
         self.copy_value(local, span)
     }
 
-    fn copy_value(&mut self, local: LocalId, span: Span) -> Eval<Value> {
-        fn copy(ev: &mut Evaluator<'_>, value: &Value, span: Span, depth: usize) -> Eval<Value> {
-            if depth >= ev.limits.max_depth {
-                return ev.fail(span, "value copy depth limit reached");
+    #[allow(clippy::too_many_lines)]
+    fn copy_value_ref(
+        ev: &mut Evaluator<'_>,
+        value: &Value,
+        span: Span,
+        depth: usize,
+    ) -> Eval<Value> {
+        if depth >= ev.limits.max_depth {
+            return ev.fail(span, "value copy depth limit reached");
+        }
+        ev.expand(size_of::<Value>(), span)?;
+        match value {
+            Value::MemoizedFunction { ty, id } => Ok(Value::MemoizedFunction {
+                ty: ty.clone(),
+                id: id.clone(),
+            }),
+            Value::VariantConstructor { ty, index } => Ok(Value::VariantConstructor {
+                ty: ty.clone(),
+                index: *index,
+            }),
+            Value::Function {
+                item,
+                ty,
+                substitutions,
+            } => Ok(Value::Function {
+                item: *item,
+                ty: ty.clone(),
+                substitutions: ev.substitute_bindings(substitutions, &BTreeMap::new(), span)?,
+            }),
+            Value::Closure {
+                ty,
+                once,
+                owner,
+                body,
+                parameters,
+                captures,
+                substitutions,
+            } => {
+                if *once {
+                    return ev.fail(span, "cannot copy a consumable closure");
+                }
+                let parameter_bytes = parameters.len().saturating_mul(size_of::<LocalId>());
+                let capture_bytes = captures.len().saturating_mul(size_of::<(LocalId, Value)>());
+                ev.expand(parameter_bytes.saturating_add(capture_bytes), span)?;
+                let mut copied = Vec::with_capacity(captures.len());
+                for (local, value) in captures {
+                    copied.push((*local, Self::copy_value_ref(ev, value, span, depth + 1)?));
+                }
+                Ok(Value::Closure {
+                    once: false,
+                    owner: *owner,
+                    substitutions: ev.substitute_bindings(substitutions, &BTreeMap::new(), span)?,
+                    ty: ty.clone(),
+                    body: body.clone(),
+                    parameters: parameters.clone(),
+                    captures: copied,
+                })
             }
-            ev.expand(size_of::<Value>(), span)?;
-            match value {
-                Value::Unit => Ok(Value::Unit),
-                Value::Int(value) => Ok(Value::Int(*value)),
-                Value::Str(value) => {
-                    ev.expand(value.len(), span)?;
-                    Ok(Value::Str(value.clone()))
+            Value::Unit => Ok(Value::Unit),
+            Value::Int(value) => Ok(Value::Int(*value)),
+            Value::Str(value) => {
+                ev.expand(value.len(), span)?;
+                Ok(Value::Str(value.clone()))
+            }
+            Value::Nominal {
+                ty,
+                value,
+                resource,
+            } => {
+                if *resource {
+                    return ev.fail(span, "cannot copy an affine resource value");
                 }
-                Value::Nominal {
-                    ty,
-                    value,
-                    resource,
-                } => {
-                    if *resource {
-                        return ev.fail(span, "cannot copy an affine resource value");
-                    }
-                    if let PrimitiveValue::Str(text) = value {
-                        ev.expand(text.len(), span)?;
-                    }
-                    Ok(Value::Nominal {
-                        ty: ty.clone(),
-                        value: value.clone(),
-                        resource: false,
-                    })
+                if let PrimitiveValue::Str(text) = value {
+                    ev.expand(text.len(), span)?;
                 }
-                Value::List { ty, items } => {
-                    ev.expand(items.len().saturating_mul(size_of::<Value>()), span)?;
-                    let mut copied = Vec::with_capacity(items.len());
-                    for item in items {
-                        copied.push(copy(ev, item, span, depth + 1)?);
-                    }
-                    Ok(Value::List {
-                        ty: ty.clone(),
-                        items: copied,
-                    })
+                Ok(Value::Nominal {
+                    ty: ty.clone(),
+                    value: value.clone(),
+                    resource: false,
+                })
+            }
+            Value::List { ty, items } => {
+                ev.expand(items.len().saturating_mul(size_of::<Value>()), span)?;
+                let mut copied = Vec::with_capacity(items.len());
+                for item in items {
+                    copied.push(Self::copy_value_ref(ev, item, span, depth + 1)?);
                 }
-                Value::Struct { ty, fields } => {
-                    ev.expand(
-                        fields.len().saturating_mul(size_of::<(String, Value)>()),
-                        span,
-                    )?;
-                    let mut copied = Vec::with_capacity(fields.len());
-                    for (name, value) in fields {
-                        ev.expand(name.len(), span)?;
-                        copied.push((name.clone(), copy(ev, value, span, depth + 1)?));
-                    }
-                    Ok(Value::Struct {
-                        ty: ty.clone(),
-                        fields: copied,
-                    })
+                Ok(Value::List {
+                    ty: ty.clone(),
+                    items: copied,
+                })
+            }
+            Value::Struct { ty, fields, owner } => {
+                ev.expand(
+                    fields.len().saturating_mul(size_of::<(String, Value)>()),
+                    span,
+                )?;
+                let mut copied = Vec::with_capacity(fields.len());
+                for (name, value) in fields {
+                    ev.expand(name.len(), span)?;
+                    copied.push((
+                        name.clone(),
+                        Self::copy_value_ref(ev, value, span, depth + 1)?,
+                    ));
                 }
-                Value::Variant { ty, index } => Ok(Value::Variant {
+                Ok(Value::Struct {
+                    ty: ty.clone(),
+                    fields: copied,
+                    owner: *owner,
+                })
+            }
+            Value::Variant { ty, index, payload } => {
+                ev.expand(payload.len().saturating_mul(size_of::<Value>()), span)?;
+                let payload = payload
+                    .iter()
+                    .map(|value| Self::copy_value_ref(ev, value, span, depth + 1))
+                    .collect::<Eval<Vec<_>>>()?;
+                Ok(Value::Variant {
                     ty: ty.clone(),
                     index: *index,
-                }),
+                    payload,
+                })
             }
         }
+    }
+
+    fn copy_value(&mut self, local: LocalId, span: Span) -> Eval<Value> {
         let value = self.locals.remove(&local).ok_or(Halt)?;
-        let result = copy(self, &value, span, 0);
+        let result = Self::copy_value_ref(self, &value, span, 0);
         self.locals.insert(local, value);
         result
     }
@@ -542,6 +1027,13 @@ impl<'a> Evaluator<'a> {
             Ok(Value::Struct {
                 ty: concrete,
                 fields: realized,
+                owner: Some(
+                    self.checked
+                        .resolved()
+                        .parsed()
+                        .owner(span.source_id())
+                        .unwrap_or(self.project_context),
+                ),
             })
         })();
         self.scopes.truncate(mark);
@@ -608,6 +1100,7 @@ impl<'a> Evaluator<'a> {
                 return Err(Halt);
             }
             self.claims.insert(key, span);
+            self.claim_effects = self.claim_effects.saturating_add(1);
         }
         Ok(Value::Nominal {
             ty,
@@ -779,7 +1272,7 @@ impl<'a> Evaluator<'a> {
         target_item: ItemId,
         span: Span,
     ) -> Eval<Value> {
-        let Value::Struct { ty, fields } = value else {
+        let Value::Struct { ty, fields, owner } = value else {
             return self.fail(span, "checked erasure produced a non-struct source");
         };
         if &ty != source_ty {
@@ -809,7 +1302,153 @@ impl<'a> Evaluator<'a> {
         Ok(Value::Struct {
             ty: target_ty,
             fields: projected,
+            owner,
         })
+    }
+
+    fn module_exports(
+        &mut self,
+        mapper: &Expression,
+        substitutions: &BTreeMap<LocalId, Ty>,
+        span: Span,
+    ) -> Eval<Value> {
+        let metadata = self.checked.expression(span).ok_or(Halt)?;
+        let Some(Elaboration::ModuleExports { key, function }) = metadata.elaboration() else {
+            return self.fail(span, "missing checked module collection metadata");
+        };
+        let entries = self.checked.resolved().module_exports(span).ok_or(Halt)?;
+        self.expand(entries.len().saturating_mul(size_of::<Value>()), span)?;
+        let callback = self.expression(mapper, substitutions)?;
+        let function = self.canonical_ty(function, substitutions, span)?;
+        let mut items = Vec::with_capacity(entries.len());
+        for entry in entries {
+            self.tick(span)?;
+            self.expand(
+                entry.key().len().saturating_add(2 * size_of::<Value>()),
+                span,
+            )?;
+            let key = self.construct_primitive(
+                *key,
+                PrimitiveValue::Str(entry.key().to_owned()),
+                span,
+                true,
+            )?;
+            let factory = Value::Function {
+                item: entry.item(),
+                ty: function.clone(),
+                substitutions: BTreeMap::new(),
+            };
+            let callable = Self::copy_value_ref(self, &callback, mapper.span, 0)?;
+            items.push(self.invoke_value(callable, vec![key, factory], span)?);
+        }
+        Ok(Value::List {
+            ty: self.canonical_ty(metadata.ty(), substitutions, span)?,
+            items,
+        })
+    }
+
+    fn compare_values(&mut self, left: Value, right: Value, span: Span) -> Eval<usize> {
+        fn primitive(value: Value) -> Option<PrimitiveValue> {
+            match value {
+                Value::Int(value) => Some(PrimitiveValue::Int(value)),
+                Value::Str(value) => Some(PrimitiveValue::Str(value)),
+                Value::Nominal {
+                    value,
+                    resource: false,
+                    ..
+                } => Some(value),
+                _ => None,
+            }
+        }
+        let ordering = match (primitive(left), primitive(right)) {
+            (Some(PrimitiveValue::Int(left)), Some(PrimitiveValue::Int(right))) => left.cmp(&right),
+            (Some(PrimitiveValue::Str(left)), Some(PrimitiveValue::Str(right))) => {
+                self.charge_steps(left.len().min(right.len()).saturating_add(1), span)?;
+                left.as_bytes().cmp(right.as_bytes())
+            }
+            _ => return self.fail(span, "checked comparison has invalid operands"),
+        };
+        Ok(match ordering {
+            std::cmp::Ordering::Less => 0,
+            std::cmp::Ordering::Equal => 1,
+            std::cmp::Ordering::Greater => 2,
+        })
+    }
+
+    fn construct_variant(
+        &mut self,
+        ty: Arc<CanonicalType>,
+        index: u32,
+        payload: Vec<Value>,
+        span: Span,
+    ) -> Eval<Value> {
+        let value = Value::Variant { ty, index, payload };
+        self.check_payload_depth(&value, span, 0)?;
+        Ok(value)
+    }
+
+    // An iterative fold can grow a recursive payload without increasing call
+    // depth. Bound the retained tree before later copying, affine inspection or
+    // destruction can recurse through it. Traversal itself consumes work budget.
+    fn check_payload_depth(&mut self, value: &Value, span: Span, depth: usize) -> Eval<()> {
+        self.tick(span)?;
+        if depth >= self.limits.max_depth {
+            return self.fail(span, "enum payload value depth limit reached");
+        }
+        match value {
+            Value::Variant { payload: items, .. } | Value::List { items, .. } => {
+                for item in items {
+                    self.check_payload_depth(item, span, depth + 1)?;
+                }
+            }
+            Value::Struct { fields, .. } => {
+                for (_, item) in fields {
+                    self.check_payload_depth(item, span, depth + 1)?;
+                }
+            }
+            Value::Closure { captures, .. } => {
+                for (_, item) in captures {
+                    self.check_payload_depth(item, span, depth + 1)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn match_payload(
+        &mut self,
+        arm: &MatchArm,
+        payload: Vec<Value>,
+        substitutions: &BTreeMap<LocalId, Ty>,
+    ) -> Eval<Value> {
+        let mut bound = Vec::new();
+        if let Pattern::Variant { bindings, .. } = &arm.pattern {
+            if bindings.len() != payload.len() {
+                return self.fail(arm.span, "checked pattern payload arity mismatch");
+            }
+            self.expand(
+                bindings
+                    .len()
+                    .saturating_mul(size_of::<(LocalId, Option<Value>)>()),
+                arm.span,
+            )?;
+            for (binding, value) in bindings.iter().zip(payload) {
+                if binding.text == "_" {
+                    continue;
+                }
+                let local = self.index.local(binding.span).ok_or(Halt)?;
+                bound.push((local, self.locals.insert(local, value)));
+            }
+        }
+        let result = self.expression(&arm.value, substitutions);
+        for (local, previous) in bound.into_iter().rev() {
+            self.locals.remove(&local);
+            if let Some(previous) = previous {
+                self.locals.insert(local, previous);
+            }
+        }
+        result
     }
 
     fn pattern_matches(
@@ -820,7 +1459,7 @@ impl<'a> Evaluator<'a> {
     ) -> Eval<bool> {
         match &arm.pattern {
             Pattern::Wildcard(_) => Ok(true),
-            Pattern::Path(path) => {
+            Pattern::Path(path) | Pattern::Variant { path, .. } => {
                 let checked = self.checked.pattern(path.span).ok_or_else(|| {
                     self.error(path.span, "missing checked pattern metadata");
                     Halt
@@ -830,7 +1469,14 @@ impl<'a> Evaluator<'a> {
                     &BTreeMap::new(),
                     path.span,
                 )?;
-                Ok(&pattern_ty == ty && checked.index() == index)
+                let same_enum = match (pattern_ty.as_ref(), ty.as_ref()) {
+                    (
+                        CanonicalType::Nominal(expected),
+                        CanonicalType::Specialization { template, .. },
+                    ) => expected == template,
+                    _ => &pattern_ty == ty,
+                };
+                Ok(same_enum && checked.index() == index)
             }
         }
     }

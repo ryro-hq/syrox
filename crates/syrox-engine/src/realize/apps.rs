@@ -5,7 +5,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use super::{
-    BuildProgress, RealizeError, ResolvedBuild, realize_declared_application, reference_parts,
+    BuildProgress, RealizeError, ResolvedBuild, plan_for_export, realize_declared_application,
+    reference_parts,
 };
 use crate::{
     BuildCancellation, CheckConfiguration, Plan, PlanApplication, PlanPackageId, RuntimeClosure,
@@ -83,7 +84,34 @@ pub fn resolve_application(
 ) -> Result<ResolvedApplication, ApplicationError> {
     let (project, export, pin) = reference_parts(reference, user)?;
     let project = std::path::absolute(project)?;
-    let plan = plan_project_with(&project, checks)?;
+    let plan = if let Some(key) = export {
+        plan_for_export(&project, key, pin, checks).map_err(|error| match error {
+            RealizeError::MissingExport(name) => ApplicationError::MissingApplication(name),
+            error => ApplicationError::Resolve(error),
+        })?
+    } else {
+        #[cfg(target_os = "linux")]
+        {
+            let locked = crate::project::open_locked_project_with(&project, checks)?;
+            if pin.is_some_and(|pin| pin.as_bytes() != locked.lock_digest()) {
+                return Err(RealizeError::CatalogDrift.into());
+            }
+            let mut evaluation = locked.evaluation()?;
+            if let Some(id) =
+                evaluation.default_package_id("default_application", "DefaultApplication")?
+            {
+                if evaluation.select_package(&id)? {
+                    evaluation.into_selected_plan()?
+                } else {
+                    plan_project_with(&project, checks)?
+                }
+            } else {
+                plan_project_with(&project, checks)?
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        plan_project_with(&project, checks)?
+    };
     if pin.is_some_and(|pin| pin.as_bytes() != plan.lock_digest()) {
         return Err(RealizeError::CatalogDrift.into());
     }

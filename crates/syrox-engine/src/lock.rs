@@ -9,6 +9,9 @@ use thiserror::Error;
 
 use crate::{AuthenticatedStandardLibrary, AuthenticatedStandardSource, LoadedProject};
 
+pub(crate) mod graph;
+use graph::{MAX_PROJECT_EDGES, ProjectEdge};
+
 pub const LOCK_FILE_NAME: &str = "Syrox.lock";
 pub const MAX_LOCK_BYTES: usize = 16 * 1024 * 1024;
 
@@ -45,6 +48,8 @@ pub(crate) struct LockManifest {
     main: LockedFile,
     inputs: Vec<LockedInput>,
     standard_library: Option<LockedStandardLibrary>,
+    edges: Vec<ProjectEdge>,
+    assets: Vec<LockedFile>,
     project_digest: [u8; 32],
     data: Vec<u8>,
     digest: [u8; 32],
@@ -114,10 +119,34 @@ impl LockManifest {
                 })
             })
             .transpose()?;
+        let mut assets = Vec::with_capacity(project.assets().len());
+        budget.collection::<LockedFile>(project.assets().len())?;
+        for asset in project.assets() {
+            let path = path_bytes(asset.relative_path())?;
+            budget.bytes(path.len())?;
+            assets.push(LockedFile {
+                path,
+                size: asset.size(),
+                digest: *asset.digest(),
+            });
+        }
+        let edges = project.child_edges();
+        if edges.len() > MAX_PROJECT_EDGES {
+            return Err(LockFormatError::InvalidField);
+        }
+        budget.collection::<ProjectEdge>(edges.len())?;
+        for edge in edges {
+            budget.bytes(edge.alias().len().saturating_add(edge.origin().len()))?;
+        }
+        let mut edges = edges.to_vec();
+        edges.sort_by(|left, right| left.alias().cmp(right.alias()));
+        ensure_sorted_unique(edges.iter().map(ProjectEdge::alias))?;
         let mut manifest = Self {
             main,
             inputs,
             standard_library,
+            edges,
+            assets,
             project_digest,
             data: Vec::new(),
             digest: [0; 32],
@@ -141,7 +170,12 @@ impl LockManifest {
         }
         let text = std::str::from_utf8(data).map_err(|_| LockFormatError::NonCanonical)?;
         let mut lines = text[..text.len() - 1].split('\n');
-        expect_line(&mut lines, "syrox-lock")?;
+        let version = match next_line(&mut lines)? {
+            "syrox-lock" => 1,
+            "syrox-lock-v2" => 2,
+            "syrox-lock-v3" => 3,
+            _ => return Err(LockFormatError::UnknownRecord),
+        };
         expect_line(&mut lines, "hash sha256")?;
         let expected_project_digest = parse_digest_line(next_line(&mut lines)?, "project")?;
         let main_parts = parts(next_line(&mut lines)?, "main", 3)?;
@@ -178,6 +212,16 @@ impl LockManifest {
             });
         }
         let standard_library = parse_standard_library(&mut lines, total_files)?;
+        let edges = if version >= 2 {
+            parse_project_edges(&mut lines, &inputs, version == 3)?
+        } else {
+            Vec::new()
+        };
+        let assets = if version == 3 {
+            parse_assets(&mut lines)?
+        } else {
+            Vec::new()
+        };
         expect_line(&mut lines, "end")?;
         if lines.next().is_some() {
             return Err(LockFormatError::UnknownRecord);
@@ -197,6 +241,8 @@ impl LockManifest {
             main,
             inputs,
             standard_library,
+            edges,
+            assets,
             project_digest: expected_project_digest,
             data: data.to_vec(),
             digest: hash(data),
@@ -224,7 +270,9 @@ impl LockManifest {
             Some(LockDrift::Project)
         } else if self.standard_library != expected.standard_library {
             Some(LockDrift::StandardLibrary)
-        } else if self.data != expected.data {
+        } else if self.edges != expected.edges {
+            Some(LockDrift::Graph)
+        } else if self.assets != expected.assets || self.data != expected.data {
             Some(LockDrift::Project)
         } else {
             None
@@ -237,7 +285,13 @@ impl LockManifest {
 
     fn encode_with_limit(&self, limit: usize) -> Result<Vec<u8>, LockFormatError> {
         let mut output = LockEncoder::new(limit);
-        output.push_str("syrox-lock\nhash sha256\nproject ")?;
+        output.push_str(if !self.assets.is_empty() {
+            "syrox-lock-v3\nhash sha256\nproject "
+        } else if self.edges.is_empty() {
+            "syrox-lock\nhash sha256\nproject "
+        } else {
+            "syrox-lock-v2\nhash sha256\nproject "
+        })?;
         hex_into(&mut output, &self.project_digest)?;
         write!(&mut output, "\nmain {} ", self.main.size).map_err(|_| LockFormatError::TooLarge)?;
         hex_into(&mut output, &self.main.digest)?;
@@ -262,6 +316,24 @@ impl LockManifest {
             encode_files(&mut output, "std-file", &standard.files)?;
         } else {
             output.push_str("std absent\n")?;
+        }
+        if !self.edges.is_empty() || !self.assets.is_empty() {
+            writeln!(&mut output, "edges {}", self.edges.len())
+                .map_err(|_| LockFormatError::TooLarge)?;
+            for edge in &self.edges {
+                output.push_str("edge ")?;
+                hex_into(&mut output, edge.alias())?;
+                output.push_str(" ")?;
+                hex_into(&mut output, edge.origin())?;
+                output.push_str(" ")?;
+                hex_into(&mut output, edge.child_lock())?;
+                output.push_str("\n")?;
+            }
+        }
+        if !self.assets.is_empty() {
+            writeln!(&mut output, "assets {}", self.assets.len())
+                .map_err(|_| LockFormatError::TooLarge)?;
+            encode_files(&mut output, "asset", &self.assets)?;
         }
         output.push_str("end\n")?;
         Ok(output.finish())
@@ -305,6 +377,7 @@ impl LockProjectionBudget {
 pub(crate) enum LockDrift {
     Project,
     StandardLibrary,
+    Graph,
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -412,9 +485,10 @@ pub(crate) fn is_canonical_logical_path(path: &[u8]) -> bool {
 
 fn valid_locator(locator: &[u8]) -> bool {
     std::str::from_utf8(locator).is_ok()
-        && locator
+        && (locator
             .strip_prefix(b"path:")
-            .is_some_and(is_canonical_logical_path)
+            .or_else(|| locator.strip_prefix(b"modules:")))
+        .is_some_and(is_canonical_logical_path)
 }
 
 #[derive(Debug)]
@@ -552,6 +626,14 @@ fn source_size(value: &str) -> Result<u64, LockFormatError> {
     Ok(size)
 }
 
+fn asset_size(value: &str) -> Result<u64, LockFormatError> {
+    let size = decimal(value)?;
+    if size > crate::MAX_PROJECT_BYTES as u64 {
+        return Err(LockFormatError::InvalidField);
+    }
+    Ok(size)
+}
+
 fn digest(value: &str) -> Result<[u8; 32], LockFormatError> {
     let decoded = hex(value)?;
     decoded
@@ -594,7 +676,11 @@ fn parse_files<'a>(
         }
         files.push(LockedFile {
             path,
-            size: source_size(file_parts[2])?,
+            size: if record == "asset" {
+                asset_size(file_parts[2])?
+            } else {
+                source_size(file_parts[2])?
+            },
             digest: digest(file_parts[3])?,
         });
     }
@@ -632,6 +718,52 @@ fn parse_standard_library<'a>(
     }))
 }
 
+fn parse_assets<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+) -> Result<Vec<LockedFile>, LockFormatError> {
+    let count = count_line(next_line(lines)?, "assets")?;
+    if count == 0 {
+        return Err(LockFormatError::InvalidField);
+    }
+    let assets = parse_files(lines, "asset", count)?;
+    ensure_sorted_unique(assets.iter().map(|file| file.path.as_slice()))?;
+    if assets
+        .iter()
+        .any(|file| !file.path.starts_with(b"assets/") || file.path.len() <= b"assets/".len())
+    {
+        return Err(LockFormatError::InvalidField);
+    }
+    Ok(assets)
+}
+
+fn parse_project_edges<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+    inputs: &[LockedInput],
+    allow_empty: bool,
+) -> Result<Vec<ProjectEdge>, LockFormatError> {
+    let count = count_line(next_line(lines)?, "edges")?;
+    if (!allow_empty && count == 0) || count > MAX_PROJECT_EDGES {
+        return Err(LockFormatError::InvalidField);
+    }
+    let mut edges = Vec::with_capacity(count);
+    for _ in 0..count {
+        let fields = parts(next_line(lines)?, "edge", 4)?;
+        let alias = hex(fields[1])?;
+        let origin = hex(fields[2])?;
+        let edge = ProjectEdge::new(
+            std::str::from_utf8(&alias).map_err(|_| LockFormatError::InvalidField)?,
+            std::str::from_utf8(&origin).map_err(|_| LockFormatError::InvalidField)?,
+            digest(fields[3])?,
+        )?;
+        if inputs.iter().any(|input| input.name == edge.alias()) {
+            return Err(LockFormatError::InvalidField);
+        }
+        edges.push(edge);
+    }
+    ensure_sorted_unique(edges.iter().map(ProjectEdge::alias))?;
+    Ok(edges)
+}
+
 fn ensure_sorted_unique<'a>(values: impl Iterator<Item = &'a [u8]>) -> Result<(), LockFormatError> {
     let mut previous: Option<&[u8]> = None;
     for value in values {
@@ -658,6 +790,8 @@ mod tests {
             main,
             inputs: Vec::new(),
             standard_library: None,
+            edges: Vec::new(),
+            assets: Vec::new(),
             data: Vec::new(),
             digest: [0; 32],
         };
@@ -677,6 +811,70 @@ mod tests {
                 .unwrap()
                 .starts_with("syrox-lock\nhash sha256\nproject ")
         );
+    }
+
+    #[test]
+    fn project_edges_round_trip_in_one_versioned_manifest_and_reject_tampering() {
+        let mut manifest = minimal();
+        manifest.edges = vec![
+            ProjectEdge::new("a", "path:../a", hash(b"a lock")).unwrap(),
+            ProjectEdge::new("z", "path:../z", hash(b"z lock")).unwrap(),
+        ];
+        let encoded = manifest.encode().unwrap();
+        assert!(encoded.starts_with(b"syrox-lock-v2\n"));
+        let parsed = LockManifest::parse(&encoded).unwrap();
+        assert_eq!(parsed.edges, manifest.edges);
+        assert_eq!(parsed.data(), encoded);
+        let mut changed = encoded.clone();
+        let position = changed
+            .windows(5)
+            .position(|part| part == b"edge ")
+            .unwrap()
+            + 5;
+        changed[position] = b'0';
+        assert!(LockManifest::parse(&changed).is_err());
+
+        let text = String::from_utf8(encoded).unwrap();
+        let first = text.lines().find(|line| line.starts_with("edge ")).unwrap();
+        let duplicate = text
+            .lines()
+            .map(|line| {
+                if line.starts_with("edge ") {
+                    first
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_eq!(
+            LockManifest::parse(duplicate.as_bytes()),
+            Err(LockFormatError::Misordered)
+        );
+        let mut reversed = manifest;
+        reversed.edges.reverse();
+        assert_eq!(
+            LockManifest::parse(&reversed.encode().unwrap()),
+            Err(LockFormatError::Misordered)
+        );
+    }
+
+    #[test]
+    fn binary_assets_have_a_canonical_versioned_inventory() {
+        let mut manifest = minimal();
+        manifest.assets.push(LockedFile {
+            path: b"assets/fix.patch".to_vec(),
+            size: 2,
+            digest: hash(b"\0x"),
+        });
+        let data = manifest.encode().unwrap();
+        assert!(data.starts_with(b"syrox-lock-v3\n"));
+        assert_eq!(LockManifest::parse(&data).unwrap().assets, manifest.assets);
+        let invalid = String::from_utf8(data)
+            .unwrap()
+            .replacen("assets 1", "assets 0", 1);
+        assert!(LockManifest::parse(invalid.as_bytes()).is_err());
     }
 
     #[test]
@@ -837,6 +1035,8 @@ mod tests {
             (b"\xff".as_slice(), b"path:dep".as_slice()),
             (b"dep", b"path:"),
             (b"dep", b"path:../dep"),
+            (b"dep", b"modules:../dep"),
+            (b"dep", b"modules:"),
             (b"dep", b"path:\xff"),
             (b"dep", b"https:dep"),
         ] {
@@ -859,6 +1059,7 @@ mod tests {
                 Err(LockFormatError::InvalidField)
             );
         }
+        assert!(valid_locator(b"modules:recipes/hello"));
 
         for path in [b"../std.srx".as_slice(), b"\xff.srx"] {
             let mut manifest = minimal();

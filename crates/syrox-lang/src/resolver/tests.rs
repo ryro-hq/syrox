@@ -70,6 +70,62 @@ fn duplicate_declarations_and_import_conflicts_are_diagnosed() {
 }
 
 #[test]
+fn module_export_selection_rejects_non_namespaces_and_non_function_exports() {
+    for (declaration, namespace, expected) in [
+        (
+            "value NotModule(str);",
+            "NotModule",
+            "requires a module namespace",
+        ),
+        (
+            "mod collection { pub struct make {} }",
+            "collection",
+            "must be a function",
+        ),
+        ("mod collection {}", "absent", "requires a module namespace"),
+    ] {
+        let source = format!(
+            "value Key(str); value I(int); {declaration} outputs {{ keys: [Key] = module_exports({namespace}, make, fn(key: Key, f: fn() -> I) -> Key {{ key }}); }}"
+        );
+        let diagnostics = errors(&[("main.srx", &source)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|error| error.message.contains(expected)),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn repeated_module_projections_charge_key_bytes_and_sorting_work() {
+    use std::fmt::Write as _;
+    let mut source = String::from(
+        "value Key(str); value I(int); mod implementation { pub fn make() -> I { I(1) } } mod collection {",
+    );
+    for index in 0..400 {
+        write!(
+            source,
+            "mod m{index}{} {{ pub use implementation::make; }}",
+            "x".repeat(250)
+        )
+        .unwrap();
+    }
+    source.push_str("} outputs {");
+    for index in 0..3 {
+        write!(source, "keys{index}: [Key] = module_exports(collection, make, fn(key: Key, f: fn() -> I) -> Key {{ key }});").unwrap();
+    }
+    source.push('}');
+    let diagnostics = errors(&[("main.srx", &source)]);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|error| error.message.contains("name resolution work limit")),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
 fn unknown_types_and_closed_interface_private_access_are_diagnosed() {
     let unknown = errors(&[("main.srx", "fn bad(item: Missing) {}")]);
     assert!(
@@ -216,7 +272,7 @@ fn authenticated_project_input_alias_resolves_only_root_outputs() {
         .add_to_input_domain(
             catalog,
             "catalog.srx",
-            "value Result(str); fn make() -> Result { \"ok\" } fn hidden() {} outputs { make: fn() -> Result = make; }",
+            "value Result(str); fn make_inner() -> Result { \"ok\" } fn hidden() {} outputs { make: fn() -> Result = make_inner; }",
         )
         .unwrap();
 
@@ -239,7 +295,7 @@ fn authenticated_project_input_alias_resolves_only_root_outputs() {
         .add_to_input_domain(
             catalog,
             "catalog.srx",
-            "value Result(str); fn make() -> Result { \"ok\" } outputs { make: fn() -> Result = make; }",
+            "value Result(str); fn make_inner() -> Result { \"ok\" } outputs { make: fn() -> Result = make_inner; }",
         )
         .unwrap();
     let program = resolve(parse_sources(&sources).unwrap()).unwrap();
@@ -267,7 +323,7 @@ fn loader_binding_without_a_matching_inputs_declaration_is_not_visible() {
         .add_to_input_domain(
             catalog,
             "catalog.srx",
-            "value Result(str); fn make() -> Result { \"ok\" } outputs { make: fn() -> Result = make; }",
+            "value Result(str); fn make_inner() -> Result { \"ok\" } outputs { make: fn() -> Result = make_inner; }",
         )
         .unwrap();
 
@@ -293,7 +349,7 @@ fn input_domains_cannot_use_project_input_aliases() {
         .add_to_input_domain(
             catalog,
             "catalog.srx",
-            "value Result(str); fn make() -> Result { \"ok\" } outputs { make: fn() -> Result = make; }",
+            "value Result(str); fn make_inner() -> Result { \"ok\" } outputs { make: fn() -> Result = make_inner; }",
         )
         .unwrap();
     let sibling = sources.create_input_domain("sibling").unwrap();
@@ -403,7 +459,16 @@ fn local_id_overflow_is_a_diagnostic_not_aliasing() {
     let mut resolver = Resolver::new(&parsed);
     resolver.next_local = u32::MAX;
 
-    assert_eq!(resolver.local(Span::new(SourceId::SINGLE, 0, 0)), None);
+    assert_eq!(
+        resolver.local(
+            &crate::Ident {
+                text: "x".into(),
+                span: Span::new(SourceId::SINGLE, 0, 0)
+            },
+            LocalKind::Binding
+        ),
+        None
+    );
     assert_eq!(
         resolver.diagnostics[0].message,
         "too many local declarations"

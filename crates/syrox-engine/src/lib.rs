@@ -28,7 +28,9 @@ mod runtime;
 mod runtime_native;
 #[cfg(target_os = "linux")]
 pub use runtime_native::runtime_helper;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod source_archive;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod store;
 
 pub use build::{
@@ -44,8 +46,7 @@ pub use build::{
 };
 pub use config::{ConfigurationError, LocalCatalog, UserConfiguration};
 pub use host::{
-    HostCapability, HostCapabilityStatus, HostInspectError, HostInspection, inspect_host,
-    inspect_host_with_probe,
+    HostCapability, HostCapabilityStatus, HostInspectError, HostInspection, inspect_host_with_probe,
 };
 pub use https_source::{
     HttpsAcquisition, HttpsError, HttpsSourceRequest, HttpsTransportPolicy,
@@ -68,19 +69,25 @@ pub use project::{
     AuthenticatedStandardLibrary, AuthenticatedStandardSource, CheckConfiguration, CheckFailure,
     CheckReport, LoadedProject, LoadedProjectInput, LoadedProjectSource, LockCleanupError,
     LockPublicationError, LockReport, MAX_DIRECTORY_DEPTH, MAX_DIRECTORY_ENTRIES,
-    MAX_PROJECT_BYTES, MAX_PROJECT_WORK, ProjectLimits, ProjectOperationError,
-    StandardLibraryError, ValidatedProject, check_file, check_path, check_path_with, check_project,
-    check_project_lock, check_project_lock_with, check_project_with, lock_project,
-    lock_project_with, plan_project, plan_project_with, validate_project, validate_project_with,
+    MAX_PROJECT_BYTES, MAX_PROJECT_WORK, ProjectAnalysis, ProjectAnalysisError,
+    ProjectAnalysisLockStatus, ProjectAnalysisSnapshot, ProjectLimits, ProjectOperationError,
+    StandardLibraryError, ValidatedProject, check_path_with, check_project, check_project_lock,
+    check_project_lock_with, check_project_with, lock_project, lock_project_with, plan_project,
+    plan_project_outputs_with, plan_project_package_with, plan_project_with, validate_project_with,
+};
+#[cfg(target_os = "linux")]
+pub use project::{
+    LockedProject, ProjectEvaluation, open_locked_project_with, open_project_analysis_with,
+    open_standard_library_analysis_with,
 };
 #[cfg(target_os = "linux")]
 pub use realize::{
     ApplicationError, ResolvedApplication, realize_application, resolve_application,
 };
 pub use realize::{
-    BuildProgress, RealizeError, ResolvedBuild, build_exports, realize_build,
-    realize_build_with_cancellation, realize_builds_with_cancellation, resolve_build,
-    resolve_builds, search_build_exports,
+    BuildProgress, RealizeError, ResolvedBuild, realize_build_with_cancellation,
+    realize_builds_with_cancellation, resolve_build, resolve_builds, search_build_exports,
+    search_project_build_exports,
 };
 #[cfg(target_os = "linux")]
 pub use runtime::{

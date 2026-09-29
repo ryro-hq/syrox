@@ -4,8 +4,29 @@ use super::{
 };
 
 impl Resolver<'_> {
-    #[allow(clippy::too_many_lines)]
     pub(super) fn lookup(
+        &mut self,
+        module: ModuleId,
+        path: &Path,
+        expected: Expected,
+    ) -> Option<ResolvedTarget> {
+        let diagnostics = self.diagnostics.len();
+        let result = self.lookup_inner(module, path, expected);
+        self.observe_namespace(
+            module,
+            path,
+            path.span,
+            super::NamespaceQuery::Lookup {
+                expected: expected.description(),
+            },
+            super::owners::ObservedNamespace::Target(result.as_ref()),
+            diagnostics,
+        );
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn lookup_inner(
         &mut self,
         module: ModuleId,
         path: &Path,
@@ -51,8 +72,10 @@ impl Resolver<'_> {
             // Only sources explicitly assigned the authenticated standard
             // library origin participate in this reserved mapping.
             bases.push((SourceDomainId::STANDARD_LIBRARY, Vec::new()));
-        } else if self.modules[module.index()].domain == SourceDomainId::PROJECT
-            && let Some(&domain) = self.input_domains.get(&written[0])
+        } else if let Some(&domain) = self
+            .input_domains
+            .get(&self.modules[module.index()].domain)
+            .and_then(|aliases| aliases.get(&written[0]))
         {
             bases.push((domain, Vec::new()));
             consumed = 1;
@@ -169,6 +192,16 @@ impl Resolver<'_> {
             {
                 let boundary_path = &boundary_module.path.segments;
                 if candidate.len() != boundary_path.len() + 1 {
+                    if candidate.len() > boundary_path.len() + 1
+                        && candidate.get(boundary_path.len()).is_some_and(|name| {
+                            self.module_info[module.index()]
+                                .public_children
+                                .contains(name)
+                        })
+                    {
+                        boundary = self.parent(module);
+                        continue;
+                    }
                     return None;
                 }
                 item = self.module_info[module.index()]
@@ -196,13 +229,14 @@ impl Resolver<'_> {
                 ResolvedItemKind::Function
                     | ResolvedItemKind::Resource
                     | ResolvedItemKind::Value
-                    | ResolvedItemKind::OutputFunction
+                    | ResolvedItemKind::OutputValue
             ),
             Expected::Value => matches!(
                 actual,
                 ResolvedItemKind::Value
                     | ResolvedItemKind::Resource
                     | ResolvedItemKind::OutputValue
+                    | ResolvedItemKind::Function
             ),
             Expected::Struct => matches!(actual, ResolvedItemKind::Struct),
         };
@@ -226,6 +260,22 @@ impl Resolver<'_> {
         module: ModuleId,
         path: &Path,
     ) -> Option<(ItemId, u32)> {
+        let diagnostics = self.diagnostics.len();
+        let result = self.lookup_variant_inner(module, path);
+        let target =
+            result.map(|(enumeration, index)| ResolvedTarget::EnumVariant { enumeration, index });
+        self.observe_namespace(
+            module,
+            path,
+            path.span,
+            super::NamespaceQuery::Variant,
+            super::owners::ObservedNamespace::Target(target.as_ref()),
+            diagnostics,
+        );
+        result
+    }
+
+    fn lookup_variant_inner(&mut self, module: ModuleId, path: &Path) -> Option<(ItemId, u32)> {
         for segment in &path.segments {
             if !self.charge(segment.span) {
                 return None;
@@ -257,8 +307,10 @@ impl Resolver<'_> {
             .is_some_and(|segment| segment.text == "std")
         {
             bases.push((SourceDomainId::STANDARD_LIBRARY, Vec::new()));
-        } else if self.modules[module.index()].domain == SourceDomainId::PROJECT
-            && let Some(&domain) = self.input_domains.get(&enum_segments[0].text)
+        } else if let Some(&domain) = self
+            .input_domains
+            .get(&self.modules[module.index()].domain)
+            .and_then(|aliases| aliases.get(&enum_segments[0].text))
         {
             bases.push((domain, Vec::new()));
             consumed = 1;

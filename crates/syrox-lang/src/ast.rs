@@ -5,7 +5,8 @@ use crate::{SourceDomainId, SourceId, Span};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedSources {
     pub(crate) sources: Vec<ParsedSource>,
-    pub(crate) input_domains: BTreeMap<String, SourceDomainId>,
+    pub(crate) input_domains: BTreeMap<SourceDomainId, BTreeMap<String, SourceDomainId>>,
+    pub(crate) project_roots: std::collections::BTreeSet<SourceDomainId>,
 }
 
 impl ParsedSources {
@@ -20,6 +21,20 @@ impl ParsedSources {
             .map(|source| &source.program)
     }
 
+    /// Project root that owns a source, including sources in its local modules.
+    pub fn owner(&self, source_id: SourceId) -> Option<SourceDomainId> {
+        let domain = self.sources.get(source_id.index())?.domain;
+        if domain == SourceDomainId::project() || self.project_roots.contains(&domain) {
+            return Some(domain);
+        }
+        self.input_domains.iter().find_map(|(parent, aliases)| {
+            aliases
+                .values()
+                .any(|candidate| *candidate == domain)
+                .then_some(*parent)
+        })
+    }
+
     pub fn declaration_count(&self) -> usize {
         self.sources
             .iter()
@@ -27,14 +42,22 @@ impl ParsedSources {
             .sum()
     }
 
-    pub(crate) fn input_domain(&self, alias: &str) -> Option<SourceDomainId> {
-        self.input_domains.get(alias).copied()
+    pub(crate) fn input_domain(
+        &self,
+        parent: SourceDomainId,
+        alias: &str,
+    ) -> Option<SourceDomainId> {
+        self.input_domains.get(&parent)?.get(alias).copied()
     }
 
     pub(crate) fn is_input_domain(&self, domain: SourceDomainId) -> bool {
         self.input_domains
             .values()
-            .any(|candidate| *candidate == domain)
+            .any(|aliases| aliases.values().any(|candidate| *candidate == domain))
+    }
+
+    pub(crate) fn is_project_root(&self, domain: SourceDomainId) -> bool {
+        domain == SourceDomainId::project() || self.project_roots.contains(&domain)
     }
 }
 
@@ -42,6 +65,7 @@ impl ParsedSources {
 pub struct ParsedSource {
     pub(crate) source_id: SourceId,
     pub(crate) domain: SourceDomainId,
+    pub(crate) module: Vec<String>,
     pub(crate) program: ParsedProgram,
 }
 
@@ -56,6 +80,10 @@ impl ParsedSource {
 
     pub const fn program(&self) -> &ParsedProgram {
         &self.program
+    }
+
+    pub fn module(&self) -> &[String] {
+        &self.module
     }
 }
 
@@ -87,6 +115,7 @@ pub struct Path {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
     pub kind: ItemKind,
+    pub public: bool,
     pub span: Span,
 }
 
@@ -150,23 +179,12 @@ pub enum OutputKind {
         name: Ident,
         ty: Type,
     },
-    Function {
-        name: Ident,
-        signature: Signature,
-        function: Path,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Signature {
-    pub parameters: Vec<Type>,
-    pub result: Type,
-    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypeAlias {
     pub name: Ident,
+    pub type_parameters: Vec<TypeParameter>,
     pub ty: Type,
 }
 
@@ -197,7 +215,14 @@ pub struct Field {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Enum {
     pub name: Ident,
-    pub variants: Vec<Ident>,
+    pub type_parameters: Vec<TypeParameter>,
+    pub variants: Vec<EnumVariant>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumVariant {
+    pub name: Ident,
+    pub payload: Vec<Type>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,6 +259,7 @@ pub enum RefinementKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Function {
     pub name: Ident,
+    pub type_parameters: Vec<TypeParameter>,
     pub parameters: Vec<Parameter>,
     pub result: Option<Type>,
     pub body: Block,
@@ -251,6 +277,8 @@ pub struct Block {
     pub statements: Vec<Statement>,
     pub tail: Option<Box<Expression>>,
     pub span: Span,
+    /// Contains recovery nodes or a missing closing delimiter; never executable.
+    pub incomplete: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -261,8 +289,22 @@ pub struct Statement {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StatementKind {
-    Let { name: Ident, value: Expression },
+    /// An unknown statement fragment, retained only by recoverable analysis.
+    Recovery {
+        binding: Option<RecoveredBinding>,
+    },
+    Let {
+        name: Ident,
+        ty: Option<Type>,
+        value: Expression,
+    },
     Expression(Expression),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveredBinding {
+    pub name: Ident,
+    pub ty: Option<Type>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -273,8 +315,16 @@ pub struct Type {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TypeKind {
-    Named { path: Path, arguments: Vec<Type> },
-    List(Path),
+    Named {
+        path: Path,
+        arguments: Vec<Type>,
+    },
+    List(Box<Type>),
+    Function {
+        parameters: Vec<Type>,
+        result: Box<Type>,
+        once: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -285,17 +335,49 @@ pub struct Expression {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExpressionKind {
+    Memoize(Box<Expression>),
+    ModuleExports {
+        namespace: Path,
+        export: Ident,
+        mapper: Box<Expression>,
+    },
+    Compare {
+        left: Box<Expression>,
+        right: Box<Expression>,
+        branches: [Box<Expression>; 3],
+    },
     Integer(IntegerLiteral),
     String(StringLiteral),
     Path(Path),
+    Specialize {
+        function: Path,
+        arguments: Vec<Type>,
+    },
+    Fold {
+        items: Box<Expression>,
+        initial: Box<Expression>,
+        step: Box<Expression>,
+    },
     Call {
         callee: Path,
         arguments: Vec<Expression>,
+    },
+    Apply {
+        callee: Box<Expression>,
+        arguments: Vec<Expression>,
+    },
+    Closure {
+        parameters: Vec<Parameter>,
+        result: Type,
+        body: Block,
+        once: bool,
     },
     Struct {
         path: Path,
         type_arguments: Vec<Type>,
         fields: Vec<StructField>,
+        /// Query-only malformed field fragments; strict parsing rejects these.
+        recovery: Vec<Span>,
     },
     List(Vec<Expression>),
     Erase {
@@ -332,6 +414,7 @@ pub struct MatchArm {
 pub enum Pattern {
     Wildcard(Span),
     Path(Path),
+    Variant { path: Path, bindings: Vec<Ident> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,7 +1,7 @@
 use super::{
     Diagnostic, Expression, ExpressionKind, Ident, IntegerLiteral, Keyword, Literal, MatchArm,
-    Parser, Path, Pattern, Span, StringLiteral, StringPart, StructField, TokenKind, Type,
-    is_keyword,
+    Parameter, Parser, Path, Pattern, Span, StringLiteral, StringPart, StructField, SyntaxKind,
+    TokenKind, Type, is_keyword,
 };
 
 impl Parser<'_> {
@@ -10,6 +10,12 @@ impl Parser<'_> {
     }
 
     fn parse_concat(&mut self, allow_struct: bool) -> Option<Expression> {
+        self.syntax(SyntaxKind::Expression, |parser| {
+            parser.parse_concat_inner(allow_struct)
+        })
+    }
+
+    fn parse_concat_inner(&mut self, allow_struct: bool) -> Option<Expression> {
         let first = self.parse_postfix(allow_struct)?;
         if !self.at(TokenKind::PlusPlus) {
             return Some(first);
@@ -27,26 +33,84 @@ impl Parser<'_> {
     }
 
     fn parse_postfix(&mut self, allow_struct: bool) -> Option<Expression> {
-        let expression = self.parse_primary(allow_struct)?;
-        let mut fields = Vec::new();
-        while self.consume(TokenKind::Dot).is_some() {
-            fields.push(self.ident("expected field name after `.`")?);
-        }
-        if fields.is_empty() {
-            return Some(expression);
-        }
-        let span = expression.span.join(fields.last()?.span);
-        Some(Expression {
-            kind: ExpressionKind::Field {
-                value: Box::new(expression),
-                fields,
-            },
-            span,
+        self.syntax(SyntaxKind::PostfixExpression, |parser| {
+            parser.parse_postfix_inner(allow_struct)
         })
     }
 
+    fn parse_postfix_inner(&mut self, allow_struct: bool) -> Option<Expression> {
+        let mut expression = self.parse_primary(allow_struct)?;
+        let mut links = 0;
+        loop {
+            if self.at(TokenKind::Dot) {
+                let field = self.syntax(SyntaxKind::FieldAccess, |parser| {
+                    parser.advance();
+                    parser.ident("expected field name after `.`")
+                })?;
+                if let ExpressionKind::Field { fields, .. } = &mut expression.kind {
+                    expression.span = expression.span.join(field.span);
+                    fields.push(field);
+                } else {
+                    links += 1;
+                    if links >= crate::MAX_DEPTH {
+                        self.error(Diagnostic::error(
+                            "postfix chain exceeds syntax nesting limit",
+                            field.span,
+                        ));
+                        return None;
+                    }
+                    expression = Expression {
+                        span: expression.span.join(field.span),
+                        kind: ExpressionKind::Field {
+                            value: Box::new(expression),
+                            fields: vec![field],
+                        },
+                    };
+                }
+            } else if let Some(open) = self.consume(TokenKind::LeftParen) {
+                links += 1;
+                if links >= crate::MAX_DEPTH {
+                    self.error(Diagnostic::error(
+                        "functional call chain exceeds syntax nesting limit",
+                        open.span,
+                    ));
+                    return None;
+                }
+                if !self.enter(open.span) {
+                    return None;
+                }
+                let arguments = self.comma_expressions(TokenKind::RightParen);
+                let close = self.expect(TokenKind::RightParen, "expected `)` after call arguments");
+                self.leave();
+                let close = close?;
+                expression = Expression {
+                    span: expression.span.join(close.span),
+                    kind: ExpressionKind::Apply {
+                        callee: Box::new(expression),
+                        arguments: arguments?,
+                    },
+                };
+            } else {
+                return Some(expression);
+            }
+        }
+    }
+
     fn parse_primary(&mut self, allow_struct: bool) -> Option<Expression> {
-        let token = self.peek()?;
+        self.syntax(SyntaxKind::PrimaryExpression, |parser| {
+            parser.parse_primary_inner(allow_struct)
+        })
+    }
+
+    fn parse_primary_inner(&mut self, allow_struct: bool) -> Option<Expression> {
+        let Some(token) = self.peek() else {
+            self.error(
+                Diagnostic::error("expected expression", self.eof_span())
+                    .with_expected(crate::SyntaxExpectation::Expression),
+            );
+            self.missing(SyntaxKind::MissingExpression);
+            return None;
+        };
         match token.kind {
             TokenKind::Integer => self.integer_literal().map(|literal| Expression {
                 span: literal.span,
@@ -61,11 +125,161 @@ impl Parser<'_> {
             TokenKind::LeftParen => self.parse_group(),
             TokenKind::Keyword(Keyword::Erase) => self.parse_erase(),
             TokenKind::Keyword(Keyword::Match) => self.parse_match(),
+            TokenKind::Keyword(Keyword::Fn | Keyword::Once) => self.parse_closure(),
+            TokenKind::Keyword(Keyword::Fold) => self.parse_fold(),
+            TokenKind::Keyword(Keyword::Compare) => self.parse_compare(),
+            TokenKind::Keyword(Keyword::ModuleExports) => self.parse_module_exports(),
+            TokenKind::Keyword(Keyword::Memoize) => self.parse_memoize(),
             _ => {
-                self.error(Diagnostic::error("expected expression", token.span));
+                self.error(
+                    Diagnostic::error("expected expression", token.span)
+                        .with_expected(crate::SyntaxExpectation::Expression),
+                );
+                self.missing(SyntaxKind::MissingExpression);
                 None
             }
         }
+    }
+
+    fn parse_closure(&mut self) -> Option<Expression> {
+        let once = self.consume_keyword(Keyword::Once);
+        let start = self
+            .expect_keyword(Keyword::Fn, "expected anonymous function")?
+            .span;
+        let open = self.expect(TokenKind::LeftParen, "expected `(` after anonymous `fn`")?;
+        if !self.enter(open.span) {
+            return None;
+        }
+        let mut parameters = Vec::new();
+        while !self.at(TokenKind::RightParen) {
+            let name = self.ident("expected closure parameter")?;
+            self.expect(TokenKind::Colon, "expected `:` after closure parameter")?;
+            let ty = self.parse_type()?;
+            parameters.push(Parameter {
+                span: name.span.join(ty.span),
+                name,
+                ty,
+            });
+            if self.consume(TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        let close = self.expect(
+            TokenKind::RightParen,
+            "expected `)` after closure parameters",
+        );
+        self.leave();
+        close?;
+        self.expect(TokenKind::Arrow, "expected `->` after closure parameters")?;
+        let result = self.parse_type()?;
+        let body = self.parse_block()?;
+        Some(Expression {
+            span: once.map_or(start, |token| token.span).join(body.span),
+            kind: ExpressionKind::Closure {
+                once: once.is_some(),
+                parameters,
+                result,
+                body,
+            },
+        })
+    }
+
+    fn parse_memoize(&mut self) -> Option<Expression> {
+        let start = self.advance()?.span;
+        let open = self.expect(TokenKind::LeftParen, "expected `(` after `memoize`")?;
+        if !self.enter(open.span) {
+            return None;
+        }
+        let value = self.parse_expression();
+        self.consume(TokenKind::Comma);
+        let close = self.expect(
+            TokenKind::RightParen,
+            "expected `)` after memoized function",
+        );
+        self.leave();
+        Some(Expression {
+            span: start.join(close?.span),
+            kind: ExpressionKind::Memoize(Box::new(value?)),
+        })
+    }
+
+    fn parse_module_exports(&mut self) -> Option<Expression> {
+        let start = self.advance()?.span;
+        let open = self.expect(TokenKind::LeftParen, "expected `(` after `module_exports`")?;
+        if !self.enter(open.span) {
+            return None;
+        }
+        let namespace = self.parse_path("expected module namespace")?;
+        self.expect(TokenKind::Comma, "expected `,` after module namespace")?;
+        let export = self.ident("expected public export name")?;
+        self.expect(TokenKind::Comma, "expected `,` after export name")?;
+        let mapper = self.parse_expression()?;
+        self.consume(TokenKind::Comma);
+        let close = self.expect(TokenKind::RightParen, "expected `)` after module mapper");
+        self.leave();
+        Some(Expression {
+            span: start.join(close?.span),
+            kind: ExpressionKind::ModuleExports {
+                namespace,
+                export,
+                mapper: Box::new(mapper),
+            },
+        })
+    }
+
+    fn parse_compare(&mut self) -> Option<Expression> {
+        let start = self.advance()?.span;
+        let open = self.expect(TokenKind::LeftParen, "expected `(` after `compare`")?;
+        if !self.enter(open.span) {
+            return None;
+        }
+        let arguments = self.comma_expressions(TokenKind::RightParen);
+        let close = self.expect(
+            TokenKind::RightParen,
+            "expected `)` after comparison branches",
+        );
+        self.leave();
+        let span = start.join(close?.span);
+        let Ok([left, right, less, equal, greater]) = <[Expression; 5]>::try_from(arguments?)
+        else {
+            self.error(Diagnostic::error(
+                "compare expects two operands and three result branches",
+                span,
+            ));
+            return None;
+        };
+        Some(Expression {
+            span,
+            kind: ExpressionKind::Compare {
+                left: Box::new(left),
+                right: Box::new(right),
+                branches: [Box::new(less), Box::new(equal), Box::new(greater)],
+            },
+        })
+    }
+
+    fn parse_fold(&mut self) -> Option<Expression> {
+        let start = self.advance()?.span;
+        let open = self.expect(TokenKind::LeftParen, "expected `(` after `fold`")?;
+        if !self.enter(open.span) {
+            return None;
+        }
+        let items = self.parse_expression()?;
+        self.expect(TokenKind::Comma, "expected `,` after fold list")?;
+        let initial = self.parse_expression()?;
+        self.expect(TokenKind::Comma, "expected `,` after fold accumulator")?;
+        let step = self.parse_expression()?;
+        self.consume(TokenKind::Comma);
+        let close = self.expect(TokenKind::RightParen, "expected `)` after fold step");
+        self.leave();
+        Some(Expression {
+            span: start.join(close?.span),
+            kind: ExpressionKind::Fold {
+                items: Box::new(items),
+                initial: Box::new(initial),
+                step: Box::new(step),
+            },
+        })
     }
 
     fn parse_path_expression(&mut self, allow_struct: bool) -> Option<Expression> {
@@ -87,7 +301,7 @@ impl Parser<'_> {
                 span: start.join(close.span),
             });
         }
-        let type_arguments = if allow_struct && self.at(TokenKind::LeftAngle) {
+        let type_arguments = if self.at(TokenKind::LeftAngle) {
             let open = self.advance()?;
             if !self.enter(open.span) {
                 return None;
@@ -104,11 +318,14 @@ impl Parser<'_> {
             return self.parse_struct_literal(path, type_arguments);
         }
         if !type_arguments.is_empty() {
-            self.error(Diagnostic::error(
-                "generic arguments in an expression require a struct literal",
-                start,
-            ));
-            return None;
+            let end = self.tokens[self.at - 1].span;
+            return Some(Expression {
+                span: start.join(end),
+                kind: ExpressionKind::Specialize {
+                    function: path,
+                    arguments: type_arguments,
+                },
+            });
         }
         Some(Expression {
             kind: ExpressionKind::Path(path),
@@ -121,34 +338,50 @@ impl Parser<'_> {
         path: Path,
         type_arguments: Vec<Type>,
     ) -> Option<Expression> {
+        self.syntax(SyntaxKind::StructLiteral, |parser| {
+            parser.parse_struct_literal_inner(path, type_arguments)
+        })
+    }
+
+    fn parse_struct_literal_inner(
+        &mut self,
+        path: Path,
+        type_arguments: Vec<Type>,
+    ) -> Option<Expression> {
         let start = path.span;
         let open = self.expect(TokenKind::LeftBrace, "expected `{` in struct literal")?;
         if !self.enter(open.span) {
             return None;
         }
-        let mut fields = Vec::new();
-        while self.peek().is_some() && !self.at(TokenKind::RightBrace) {
-            let field_start = self.peek()?.span;
-            let name = self.ident("expected struct field name")?;
-            self.expect(TokenKind::Equal, "expected `=` after struct field name")?;
-            let value = self.parse_expression()?;
-            let end = self.expect(TokenKind::Semicolon, "expected `;` after struct field")?;
-            fields.push(StructField {
+        let (fields, mut recovery) = self.recoverable_entries(SyntaxKind::FieldValue, |parser| {
+            let field_start = parser.peek()?.span;
+            let name = parser.ident("expected struct field name")?;
+            parser.expect(TokenKind::Equal, "expected `=` after struct field name")?;
+            let value = parser.parse_expression()?;
+            let end = parser.expect(TokenKind::Semicolon, "expected `;` after struct field")?;
+            Some(StructField {
                 name,
                 value,
                 span: field_start.join(end.span),
-            });
-        }
+            })
+        });
         let close = self.expect(TokenKind::RightBrace, "expected `}` after struct literal");
         self.leave();
-        let close = close?;
+        let end = if let Some(close) = close {
+            close.span
+        } else {
+            let end = self.eof_span();
+            recovery.push(end);
+            end
+        };
         Some(Expression {
             kind: ExpressionKind::Struct {
                 path,
                 type_arguments,
                 fields,
+                recovery,
             },
-            span: start.join(close.span),
+            span: start.join(end),
         })
     }
 
@@ -267,7 +500,26 @@ impl Parser<'_> {
         {
             return self.advance().map(|token| Pattern::Wildcard(token.span));
         }
-        self.parse_path("expected match pattern").map(Pattern::Path)
+        let path = self.parse_path("expected match pattern")?;
+        if let Some(open) = self.consume(TokenKind::LeftParen) {
+            if !self.enter(open.span) {
+                return None;
+            }
+            let bindings = if self.at(TokenKind::RightParen) {
+                Some(Vec::new())
+            } else {
+                self.comma_idents(TokenKind::RightParen, true)
+            };
+            let close = self.expect(TokenKind::RightParen, "expected `)` after pattern bindings");
+            self.leave();
+            close?;
+            Some(Pattern::Variant {
+                path,
+                bindings: bindings?,
+            })
+        } else {
+            Some(Pattern::Path(path))
+        }
     }
 
     pub(super) fn parse_literal(&mut self) -> Option<Literal> {
@@ -309,6 +561,9 @@ impl Parser<'_> {
         let mut at = 1;
         let mut text_start = at;
         while at + 1 < bytes.len() {
+            if self.cancelled() {
+                return None;
+            }
             if bytes[at] == b'\\' {
                 at += 2;
                 continue;
@@ -324,6 +579,9 @@ impl Parser<'_> {
                 at += 2;
                 let path_start = at;
                 while at + 1 < bytes.len() && bytes[at] != b'}' {
+                    if self.cancelled() {
+                        return None;
+                    }
                     at += 1;
                 }
                 if at + 1 >= bytes.len() {

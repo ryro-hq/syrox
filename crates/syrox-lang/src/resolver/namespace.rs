@@ -8,18 +8,24 @@ impl Resolver<'_> {
     #[allow(clippy::too_many_lines)]
     pub(super) fn collect(&mut self) {
         let mut module_paths = BTreeSet::new();
+        let mut public_paths = BTreeSet::new();
         let mut pending = Vec::new();
         let mut boundaries: BTreeMap<DomainPath, BoundarySpans> = BTreeMap::new();
 
         for source in self.parsed.iter() {
             let domain = source.domain();
             module_paths.insert((domain, Vec::new()));
+            for depth in 1..=source.module().len() {
+                let prefix = source.module()[..depth].to_vec();
+                module_paths.insert((domain, prefix.clone()));
+                public_paths.insert((domain, prefix));
+            }
             let mut stack: Vec<(&Item, Vec<String>)> = source
                 .program()
                 .items
                 .iter()
                 .rev()
-                .map(|item| (item, Vec::new()))
+                .map(|item| (item, source.module().to_vec()))
                 .collect();
             while let Some((item, module_path)) = stack.pop() {
                 if !self.charge(item.span) {
@@ -40,7 +46,7 @@ impl Resolver<'_> {
                         }
                     }
                     ItemKind::Inputs(inputs) => {
-                        if domain != crate::SourceDomainId::PROJECT || !module_path.is_empty() {
+                        if !self.parsed.is_project_root(domain) || !module_path.is_empty() {
                             self.error(
                                 "`inputs` blocks are only allowed at the project root",
                                 item.span,
@@ -48,8 +54,12 @@ impl Resolver<'_> {
                             continue;
                         }
                         for input in &inputs.entries {
-                            if let Some(domain) = self.parsed.input_domain(&input.name.text) {
-                                self.input_domains.insert(input.name.text.clone(), domain);
+                            if let Some(child) = self.parsed.input_domain(domain, &input.name.text)
+                            {
+                                self.input_domains
+                                    .entry(domain)
+                                    .or_default()
+                                    .insert(input.name.text.clone(), child);
                             }
                         }
                         let entry = boundaries.entry((domain, module_path)).or_default();
@@ -59,8 +69,12 @@ impl Resolver<'_> {
                     }
                     ItemKind::Outputs(outputs) => {
                         let entry = boundaries.entry((domain, module_path.clone())).or_default();
-                        if entry.1.replace(item.span).is_some() {
-                            self.error("duplicate `outputs` boundary in module", item.span);
+                        if let Some(first) = entry.1 {
+                            if first.source_id() == item.span.source_id() {
+                                self.error("duplicate `outputs` boundary in module", item.span);
+                            }
+                        } else {
+                            entry.1 = Some(item.span);
                         }
                         for output in &outputs.entries {
                             if !self.charge(output.span) {
@@ -78,6 +92,7 @@ impl Resolver<'_> {
                                 kind: ResolvedItemKind::OutputValue,
                                 span: output.span,
                                 variants: Vec::new(),
+                                public: false,
                             });
                         }
                     }
@@ -86,10 +101,10 @@ impl Resolver<'_> {
                             let variants = if let ItemKind::Enum(enumeration) = &item.kind {
                                 let mut variants = Vec::with_capacity(enumeration.variants.len());
                                 for variant in &enumeration.variants {
-                                    if !self.charge(variant.span) {
+                                    if !self.charge(variant.name.span) {
                                         return;
                                     }
-                                    variants.push((variant.text.clone(), variant.span));
+                                    variants.push((variant.name.text.clone(), variant.name.span));
                                 }
                                 variants
                             } else {
@@ -104,6 +119,7 @@ impl Resolver<'_> {
                                 kind,
                                 span,
                                 variants,
+                                public: item.public,
                             });
                         }
                     }
@@ -127,6 +143,11 @@ impl Resolver<'_> {
                 self.module_info[parent_id.index()]
                     .children
                     .insert(name.clone(), module.id);
+                if public_paths.contains(&(module.domain, module.path.segments.clone())) {
+                    self.module_info[parent_id.index()]
+                        .public_children
+                        .insert(name.clone());
+                }
             }
         }
         for ((domain, path), (_, outputs)) in boundaries {
@@ -174,7 +195,10 @@ impl Resolver<'_> {
             self.item_ids.insert(key, id);
             self.module_info[module.index()]
                 .declarations
-                .insert(name, id);
+                .insert(name.clone(), id);
+            if declaration.public {
+                self.module_info[module.index()].exports.insert(name, id);
+            }
             self.items.push(ResolvedItem {
                 id,
                 domain: declaration.domain,
@@ -204,6 +228,12 @@ impl Resolver<'_> {
     pub(super) fn bind_interfaces_and_imports(&mut self) {
         // Value outputs have synthetic declarations collected above. Install
         // them and validate names before resolving graph edges.
+        let mut exported_names = BTreeSet::new();
+        for module in &self.modules {
+            for name in self.module_info[module.id.index()].exports.keys() {
+                exported_names.insert((module.domain, module.path.segments.clone(), name.clone()));
+            }
+        }
         for located in self.walk_items() {
             if !self.charge(located.item.span) {
                 return;
@@ -218,10 +248,17 @@ impl Resolver<'_> {
                         }
                         let name = match &output.kind {
                             crate::OutputKind::Value { name, .. }
-                            | crate::OutputKind::Type { name, .. }
-                            | crate::OutputKind::Function { name, .. } => &name.text,
+                            | crate::OutputKind::Type { name, .. } => &name.text,
                         };
                         if !names.insert(name.clone()) {
+                            self.error("duplicate output name", output.span);
+                            continue;
+                        }
+                        if !exported_names.insert((
+                            located.domain,
+                            located.module_path.clone(),
+                            name.clone(),
+                        )) {
                             self.error("duplicate output name", output.span);
                             continue;
                         }
@@ -289,6 +326,7 @@ impl Resolver<'_> {
                         &name.text,
                         located.item.span,
                         report_missing,
+                        located.item.public,
                     );
                 }
             } else if let Some(name) = import.path.segments.last() {
@@ -298,6 +336,7 @@ impl Resolver<'_> {
                     &name.text,
                     located.item.span,
                     report_missing,
+                    located.item.public,
                 );
             }
         }
@@ -320,20 +359,20 @@ impl Resolver<'_> {
                 }
                 let (name, path, expected, kind) = match &output.kind {
                     crate::OutputKind::Value { .. } => continue,
-                    crate::OutputKind::Type { name, ty } => (
-                        &name.text,
-                        type_path(ty),
-                        Expected::Type,
-                        ReferenceKind::Type,
-                    ),
-                    crate::OutputKind::Function { name, function, .. } => (
-                        &name.text,
-                        function,
-                        Expected::Function,
-                        ReferenceKind::Function,
-                    ),
+                    crate::OutputKind::Type { name, ty } => {
+                        let Some(path) = type_path(ty) else {
+                            if report_missing {
+                                self.error("type export requires a named type", ty.span);
+                            }
+                            continue;
+                        };
+                        (&name.text, path, Expected::Type, ReferenceKind::Type)
+                    }
                 };
                 if self.module_info[module.index()].exports.contains_key(name) {
+                    if report_missing && self.public_imports.contains(&(module, name.clone())) {
+                        self.error("public import conflicts with an output", output.span);
+                    }
                     continue;
                 }
                 let diagnostics = self.diagnostics.len();
@@ -366,6 +405,7 @@ impl Resolver<'_> {
         name: &str,
         span: Span,
         report_missing: bool,
+        public: bool,
     ) -> bool {
         let diagnostics = self.diagnostics.len();
         let Some(target) = self.lookup(module, path, Expected::Any) else {
@@ -400,9 +440,21 @@ impl Resolver<'_> {
             }
             return false;
         }
+        if public && self.module_info[module.index()].exports.contains_key(name) {
+            if report_missing {
+                self.error("public import conflicts with an export", span);
+            }
+            return false;
+        }
         self.module_info[module.index()]
             .imports
             .insert(name.to_owned(), item);
+        if public {
+            self.module_info[module.index()]
+                .exports
+                .insert(name.to_owned(), item);
+            self.public_imports.insert((module, name.to_owned()));
+        }
         self.references.push(ResolvedReference {
             span: path.span,
             kind: ReferenceKind::Import,
@@ -412,7 +464,7 @@ impl Resolver<'_> {
     }
 }
 
-fn declaration(item: &Item) -> Option<(&str, ResolvedItemKind, Span)> {
+pub(super) fn declaration(item: &Item) -> Option<(&str, ResolvedItemKind, Span)> {
     match &item.kind {
         ItemKind::TypeAlias(declaration) => Some((
             &declaration.name.text,
@@ -454,8 +506,10 @@ fn append(path: &[String], name: &str) -> Vec<String> {
     result
 }
 
-fn type_path(ty: &Type) -> &Path {
+fn type_path(ty: &Type) -> Option<&Path> {
     match &ty.kind {
-        TypeKind::Named { path, .. } | TypeKind::List(path) => path,
+        TypeKind::Named { path, .. } => Some(path),
+        TypeKind::List(element) => type_path(element),
+        TypeKind::Function { .. } => None,
     }
 }

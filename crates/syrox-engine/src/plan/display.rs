@@ -59,6 +59,11 @@ fn display_plan<W: fmt::Write + ?Sized>(plan: &Plan, formatter: &mut W) -> fmt::
                 " sha256 {} max {}",
                 source.digest, source.maximum_bytes
             )?;
+            if source.url.starts_with("project:")
+                && let Some(owner) = source.owner
+            {
+                writeln!(formatter, "    project-domain {}", owner.as_u32())?;
+            }
         }
     }
     writeln!(formatter, "builds {}", plan.builds.len())?;
@@ -198,7 +203,20 @@ impl fmt::Display for DisplayValue<'_> {
                 }
                 formatter.write_str("}")
             }
-            PlanValue::Variant { ty, index } => write!(formatter, "{}::{index}", DisplayType(ty)),
+            PlanValue::Variant { ty, index, payload } => {
+                write!(formatter, "{}::{index}", DisplayType(ty))?;
+                if !payload.is_empty() {
+                    formatter.write_str("(")?;
+                    for (position, value) in payload.iter().enumerate() {
+                        if position > 0 {
+                            formatter.write_str(", ")?;
+                        }
+                        write!(formatter, "{}", DisplayValue(value))?;
+                    }
+                    formatter.write_str(")")?;
+                }
+                Ok(())
+            }
         }
     }
 }

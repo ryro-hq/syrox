@@ -26,19 +26,36 @@ impl LocalId {
 }
 
 /// A local identity and the declaration that introduced it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedLocal {
     pub(super) id: LocalId,
     pub(super) span: Span,
+    pub(super) name: String,
+    pub(super) kind: LocalKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalKind {
+    Binding,
+    Parameter,
+    Pattern,
+    TypeParameter,
 }
 
 impl ResolvedLocal {
-    pub const fn id(self) -> LocalId {
+    pub const fn id(&self) -> LocalId {
         self.id
     }
 
-    pub const fn span(self) -> Span {
+    pub const fn span(&self) -> Span {
         self.span
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub const fn kind(&self) -> LocalKind {
+        self.kind
     }
 }
 
@@ -63,7 +80,6 @@ pub enum ResolvedItemKind {
     Function,
     OutputValue,
     OutputType,
-    OutputFunction,
 }
 
 impl ResolvedItemKind {
@@ -89,7 +105,6 @@ impl ResolvedItemKind {
             Self::Function => "function",
             Self::OutputValue => "output value",
             Self::OutputType => "exported type",
-            Self::OutputFunction => "exported function",
         }
     }
 }
@@ -210,9 +225,54 @@ pub struct ResolvedProgram {
     pub(super) items: Vec<ResolvedItem>,
     pub(super) references: Vec<ResolvedReference>,
     pub(super) locals: Vec<ResolvedLocal>,
+    pub(super) module_exports:
+        std::collections::BTreeMap<(usize, u32, u32), Vec<ResolvedModuleExport>>,
+    pub(super) editor: Option<std::sync::Arc<super::editor::Namespace>>,
+    pub(super) ambiguous_names: std::sync::OnceLock<std::collections::BTreeSet<ItemId>>,
+}
+
+/// A public function selected from an authenticated module namespace.
+/// Reexports retain the canonical item identity; keys describe the exporting module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedModuleExport {
+    pub(super) key: String,
+    pub(super) item: ItemId,
+}
+
+impl ResolvedModuleExport {
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+    pub const fn item(&self) -> ItemId {
+        self.item
+    }
 }
 
 impl ResolvedProgram {
+    pub(crate) fn ambiguous_type_name(&self, id: ItemId) -> bool {
+        self.ambiguous_names
+            .get_or_init(|| {
+                let mut first = std::collections::BTreeMap::new();
+                let mut ambiguous = std::collections::BTreeSet::new();
+                for item in &self.items {
+                    let (domain, original) = first
+                        .entry(item.path())
+                        .or_insert((item.domain(), item.id()));
+                    if *domain != item.domain() {
+                        ambiguous.insert(*original);
+                        ambiguous.insert(item.id());
+                    }
+                }
+                ambiguous
+            })
+            .contains(&id)
+    }
+    pub fn module_exports(&self, span: Span) -> Option<&[ResolvedModuleExport]> {
+        self.module_exports
+            .get(&(span.source_id().index(), span.start(), span.end()))
+            .map(Vec::as_slice)
+    }
+
     pub const fn parsed(&self) -> &ParsedSources {
         &self.parsed
     }
@@ -229,8 +289,8 @@ impl ResolvedProgram {
         self.references.iter()
     }
 
-    pub fn locals(&self) -> impl ExactSizeIterator<Item = ResolvedLocal> + '_ {
-        self.locals.iter().copied()
+    pub fn locals(&self) -> impl ExactSizeIterator<Item = &ResolvedLocal> + '_ {
+        self.locals.iter()
     }
 
     /// References whose final enum variant identity requires an expected type.

@@ -18,6 +18,8 @@ mod inspect_source;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 mod install_self;
+#[cfg(target_os = "linux")]
+mod lsp;
 mod recover_builds;
 mod reference;
 mod reindex_builds;
@@ -49,6 +51,9 @@ enum StandardLibrarySelection {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Serve editor diagnostics and navigation over LSP stdio.
+    #[cfg(target_os = "linux")]
+    Lsp { path: Option<PathBuf> },
     /// Install this release and its embedded worker without host utilities.
     #[cfg(target_os = "linux")]
     InstallSelf(install_self::Arguments),
@@ -148,6 +153,8 @@ fn main() -> ExitCode {
         StandardLibrarySelection::Bundled
     ));
     match cli.command {
+        #[cfg(target_os = "linux")]
+        Command::Lsp { path } => lsp::run(path, configuration),
         #[cfg(target_os = "linux")]
         Command::InstallSelf(arguments) => install_self::run(&arguments),
         Command::Host { command } => match command {

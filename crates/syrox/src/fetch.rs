@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use syrox_engine::{
     CheckConfiguration, HttpsSourceRequest, HttpsTransportPolicy, RootName, Store, acquire_https,
-    plan_project_with,
+    plan_project_package_with,
 };
 
 /// The exact URL grant is independent of the project lock and digest. Disallow
@@ -46,7 +46,8 @@ fn fetch(
     allow_https: &str,
     configuration: &CheckConfiguration,
 ) -> Result<String, String> {
-    let plan = plan_project_with(project, configuration).map_err(|error| error.to_string())?;
+    let plan = plan_project_package_with(project, configuration, package)
+        .map_err(|error| error.to_string())?;
     let request = plan
         .acquisitions()
         .find(|acquisition| acquisition.package().as_str() == package)

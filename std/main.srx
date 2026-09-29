@@ -1,0 +1,32 @@
+mod std {
+    pub use option::Option;
+    pub use result::Result;
+
+    pub use catalog::{PackageSet, package_set, package_set_refs, package_names, package_ref, package_factory, package_get};
+    pub use recipe::{
+        RecipeRef, OutputRef, recipe_ref, recipe_factory, recipe_value,
+        recipe_output, output_recipe, output_name,
+    };
+
+    pub use list::{map, flatten, filter_map, filter};
+    pub use maps::{
+        OrderedMap, MapKey, MapEntry,
+        map_empty, map_insert, map_from_entries, map_merge,
+        map_get, map_entries, map_keys, map_values,
+    };
+
+    // Package identity, dependencies and source acquisition.
+    pub use pkg::{
+        PackageId, Package, Dependency,
+        SourceUrl, SourceDigest, SourceLimit,
+        SourceRequest, source_request, Acquisition,
+    };
+
+    // Recipes, builders, selected outputs and runtime.
+    pub use pkg::{
+        Recipe, ApplicationRecipe, CatalogRecipe,
+        SourceDirectory, InstalledEntry, BuildTimeout, OutputName,
+        AutotoolsBuild, GlibcBuild, Build, BuildOutput, BuildInputs, DefaultBuild,
+        RuntimeLoader, RuntimeLibrary, Application, DefaultApplication,
+    };
+}

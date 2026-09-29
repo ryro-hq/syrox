@@ -350,6 +350,17 @@ pub(crate) fn open_top_directory(path: &Path) -> Result<OpenedPath, OpenError> {
     open_at2(libc::AT_FDCWD, path, true, TOP_LEVEL_RESOLUTION)
 }
 
+/// Open the parent of an explicitly authorized project root. Unlike a path
+/// basename this also works for roots spelled `.` or `..`.
+pub(crate) fn open_project_parent(directory: BorrowedFd<'_>) -> Result<OpenedPath, OpenError> {
+    open_at2(
+        directory.as_raw_fd(),
+        Path::new(".."),
+        true,
+        TOP_LEVEL_RESOLUTION,
+    )
+}
+
 pub(crate) fn open_beneath(
     directory: BorrowedFd<'_>,
     path: &Path,

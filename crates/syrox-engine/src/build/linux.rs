@@ -1124,15 +1124,8 @@ mod tests {
             source: std::Acquisition = std::Acquisition {{ package = "hello"; sources = [std::SourceRequest {{ url = "https://example.invalid/archive"; sha256 = "{digest}"; maximum_bytes = 1024; }}]; }};
             build: std::AutotoolsBuild = std::AutotoolsBuild {{ package = "hello"; source_directory = "hello-1"; entry = "usr/bin/hello"; timeout_seconds = 120; }};
         }}"#)).unwrap();
-        let standard = crate::AuthenticatedStandardSource::from_authenticated(
-            "std/pkg.srx",
-            include_str!("../../../../std/pkg.srx"),
-        )
-        .unwrap();
         let checks = crate::CheckConfiguration {
-            standard_library: Some(
-                crate::AuthenticatedStandardLibrary::from_authenticated(vec![standard]).unwrap(),
-            ),
+            standard_library: Some(crate::AuthenticatedStandardLibrary::bundled()),
             ..crate::CheckConfiguration::default()
         };
         crate::lock_project_with(&project, &checks).unwrap();

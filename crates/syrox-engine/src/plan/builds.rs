@@ -1,7 +1,7 @@
 use super::{
     AuthenticatedStandardLibrary, BTreeMap, PlanAcquisition, PlanError, PlanPackage, PlanPackageId,
-    PrimitiveValue, ProjectionBudget, RealizedProgram, Value, decode_nominal_string,
-    decode_package_id, exact_nominal,
+    PrimitiveValue, ProjectionBudget, Value, decode_nominal_string, decode_package_id,
+    exact_nominal,
 };
 
 const BUILD_PATH: &[&str] = &["std", "pkg", "AutotoolsBuild"];
@@ -63,7 +63,7 @@ impl PlanBuild {
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn extract(
-    realized: &RealizedProgram,
+    components: &[super::recipes::Component<'_>],
     packages: &[PlanPackage],
     acquisitions: &[PlanAcquisition],
     standard_library: Option<&AuthenticatedStandardLibrary>,
@@ -72,15 +72,13 @@ pub(super) fn extract(
     if standard_library.is_none() {
         return Ok((Vec::new(), None));
     }
-    let mut roots: Vec<_> = realized
-        .roots()
+    let mut roots: Vec<_> = components
+        .iter()
         .filter(|root| {
             root.identity().domain() == syrox_lang::SourceDomainId::project()
-                && root.ty().is_some_and(|ty| {
-                    exact_nominal(ty, BUILD_PATH)
-                        || exact_nominal(ty, GLIBC_PATH)
-                        || exact_nominal(ty, DEFAULT_PATH)
-                })
+                && (exact_nominal(root.ty(), BUILD_PATH)
+                    || exact_nominal(root.ty(), GLIBC_PATH)
+                    || exact_nominal(root.ty(), DEFAULT_PATH))
         })
         .collect();
     roots.sort_by(|left, right| left.identity().cmp(right.identity()));
@@ -106,7 +104,7 @@ pub(super) fn extract(
             root: name.clone(),
             reason,
         };
-        let Some(Value::Struct { ty, fields }) = root.value() else {
+        let Value::Struct { ty, fields, .. } = root.value() else {
             return Err(invalid("expected an exact std build struct"));
         };
         let is_default = exact_nominal(ty, DEFAULT_PATH);
@@ -192,7 +190,7 @@ pub(super) fn extract(
             });
         }
     }
-    extract_build_inputs(realized, &by_id, &mut builds, budget)?;
+    extract_build_inputs(components, &by_id, &mut builds, budget)?;
     if let Some(package) = &default
         && builds
             .binary_search_by(|build| build.package.cmp(package))
@@ -210,16 +208,16 @@ const INPUTS_PATH: &[&str] = &["std", "pkg", "BuildInputs"];
 const OUTPUT_PATH: &[&str] = &["std", "pkg", "BuildOutput"];
 
 fn extract_build_inputs(
-    realized: &RealizedProgram,
+    components: &[super::recipes::Component<'_>],
     packages: &BTreeMap<&str, &PlanPackage>,
     builds: &mut [PlanBuild],
     budget: &mut ProjectionBudget,
 ) -> Result<(), PlanError> {
     use super::CanonicalType;
     let mut seen = std::collections::BTreeSet::new();
-    for root in realized.roots().filter(|root| {
+    for root in components.iter().filter(|root| {
         root.identity().domain() == syrox_lang::SourceDomainId::project()
-            && root.ty().is_some_and(|ty| exact_nominal(ty, INPUTS_PATH))
+            && exact_nominal(root.ty(), INPUTS_PATH)
     }) {
         budget.node::<PlanBuild>()?;
         let name = budget.string(root.name())?;
@@ -227,7 +225,7 @@ fn extract_build_inputs(
             root: name.clone(),
             reason,
         };
-        let Some(Value::Struct { ty, fields }) = root.value() else {
+        let Value::Struct { ty, fields, .. } = root.value() else {
             return Err(invalid("expected exact std build inputs"));
         };
         if !exact_nominal(ty, INPUTS_PATH)
@@ -254,7 +252,7 @@ fn extract_build_inputs(
                 "this build requires exactly one development output",
             ));
         }
-        let Value::Struct { ty, fields } = &items[0] else {
+        let Value::Struct { ty, fields, .. } = &items[0] else {
             return Err(invalid("invalid development output"));
         };
         if !exact_nominal(ty, OUTPUT_PATH)
