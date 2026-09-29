@@ -460,8 +460,10 @@ pub fn realize_build_with_cancellation(
     worker: &Path,
     offline: bool,
     cancellation: &BuildCancellation,
-    mut progress: impl FnMut(BuildProgress),
+    progress: impl FnMut(BuildProgress),
 ) -> Result<BuildResult, RealizeError> {
+    #[cfg(target_os = "linux")]
+    let mut progress = progress;
     #[cfg(target_os = "linux")]
     if resolved
         .plan

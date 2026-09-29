@@ -19,6 +19,7 @@ use std::io::Seek as _;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsFd as _;
 
+#[cfg(target_os = "linux")]
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -828,10 +829,11 @@ impl StoreStaging {
         }
     }
 
-    pub fn abort(mut self) -> Result<(), StoreError> {
+    pub fn abort(self) -> Result<(), StoreError> {
         #[cfg(target_os = "linux")]
         {
-            self.temporary.discard().map_err(map_cleanup_uncertain)
+            let mut self_ = self;
+            self_.temporary.discard().map_err(map_cleanup_uncertain)
         }
         #[cfg(not(target_os = "linux"))]
         {

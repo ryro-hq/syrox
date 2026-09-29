@@ -17,6 +17,7 @@ pub use editor::{
 #[cfg(target_os = "linux")]
 pub use editor::{open_project_analysis_with, open_standard_library_analysis_with};
 
+#[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -262,9 +263,15 @@ impl LoadedProject {
         self.assets.iter()
     }
 
-    #[cfg(target_os = "linux")]
     pub(crate) fn child_edges(&self) -> &[crate::lock::graph::ProjectEdge] {
-        &self.child_edges
+        #[cfg(target_os = "linux")]
+        {
+            &self.child_edges
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            &[]
+        }
     }
 }
 

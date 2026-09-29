@@ -9,9 +9,11 @@ mod dns;
 
 use thiserror::Error;
 
+#[cfg(target_os = "linux")]
+use crate::store::StoreStaging;
 use crate::store::{
     ContentDigest, MAX_STORE_BLOB_BYTES, RootName, RootPublicationState, Store, StoreError,
-    StoreObject, StoreStaging,
+    StoreObject,
 };
 
 pub const MAX_HTTPS_URL_BYTES: usize = 4096;

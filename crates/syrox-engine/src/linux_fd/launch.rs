@@ -256,14 +256,17 @@ mod tests {
     fn spawn_transfers_only_selected_fds_and_preserves_argument_bytes() {
         let (mut read, write) = UnixStream::pair().unwrap();
         let (unused, _) = UnixStream::pair().unwrap();
+        let unused_target =
+            std::fs::read_link(format!("/proc/self/fd/{}", unused.as_raw_fd())).unwrap();
         let mut command = PreparedLaunch::new(OsStr::new("/bin/sh")).unwrap();
         command.inherit(write.as_fd());
         command
             .args([
                 "-c",
                 &format!(
-                    "test ! -e /proc/self/fd/{} || exit 9; printf '%s' \"$1\" >&{}",
+                    "test \"$(readlink /proc/self/fd/{})\" != '{}' || exit 9; printf '%s' \"$1\" >&{}",
                     unused.as_raw_fd(),
+                    unused_target.display(),
                     write.as_raw_fd()
                 ),
                 "sh",
