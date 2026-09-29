@@ -162,7 +162,7 @@ pub fn inspect_archive_with_cancellation(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (store, digest, format, limits, cancellation);
-        return Err(ArchiveError::Store(StoreError::UnsupportedPlatform));
+        Err(ArchiveError::Store(StoreError::UnsupportedPlatform))
     }
     #[cfg(target_os = "linux")]
     {

@@ -45,6 +45,7 @@ pub struct BuildCancellation {
     >,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(clippy::derivable_impls))]
 impl Default for BuildCancellation {
     fn default() -> Self {
         Self {
@@ -59,6 +60,7 @@ impl Default for BuildCancellation {
 
 impl BuildCancellation {
     /// Use a caller-owned flag, for example one registered with a signal handler.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::needless_update))]
     pub fn from_flag(flag: Arc<AtomicBool>) -> Self {
         Self {
             flag,

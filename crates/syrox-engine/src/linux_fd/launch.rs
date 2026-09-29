@@ -258,7 +258,8 @@ mod tests {
         let (unused, _) = UnixStream::pair().unwrap();
         let unused_target =
             std::fs::read_link(format!("/proc/self/fd/{}", unused.as_raw_fd())).unwrap();
-        let mut command = PreparedLaunch::new(OsStr::new("/bin/sh")).unwrap();
+        // Bash accepts redirections to inherited descriptors above 9; dash does not.
+        let mut command = PreparedLaunch::new(OsStr::new("/bin/bash")).unwrap();
         command.inherit(write.as_fd());
         command
             .args([

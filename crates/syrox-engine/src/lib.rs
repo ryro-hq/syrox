@@ -28,7 +28,9 @@ mod runtime;
 mod runtime_native;
 #[cfg(target_os = "linux")]
 pub use runtime_native::runtime_helper;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod source_archive;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod store;
 
 pub use build::{

@@ -263,6 +263,7 @@ impl LoadedProject {
         self.assets.iter()
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_self))]
     pub(crate) fn child_edges(&self) -> &[crate::lock::graph::ProjectEdge] {
         #[cfg(target_os = "linux")]
         {
